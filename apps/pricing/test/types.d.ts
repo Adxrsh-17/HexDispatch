@@ -3,3 +3,4 @@ declare module 'ioredis-mock' {
   const RedisMock: new (...args: unknown[]) => Redis;
   export default RedisMock;
 }
+

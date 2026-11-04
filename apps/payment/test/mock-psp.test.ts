@@ -70,3 +70,4 @@ describe('Mock PSP Client (Task 1 & 3)', () => {
     expect(record?.amountMinorUnits).toBe(3000);
   });
 });
+

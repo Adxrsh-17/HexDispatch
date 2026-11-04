@@ -86,3 +86,4 @@ describe('Fare Model (Task 1)', () => {
     expect(resSuv.totalFareMinorUnits).toBe(22000);
   });
 });
+

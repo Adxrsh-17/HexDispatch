@@ -18,3 +18,4 @@ export function runDockerCommand(cmd: string): { success: boolean; output: strin
     return { success: false, output: err instanceof Error ? err.message : String(err) };
   }
 }
+

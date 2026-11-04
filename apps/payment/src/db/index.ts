@@ -11,3 +11,4 @@ export function getPaymentDb(connectionString = PAYMENT_DB_DEFAULT_URL) {
 }
 
 export * from './schema';
+

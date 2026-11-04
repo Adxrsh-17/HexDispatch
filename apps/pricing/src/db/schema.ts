@@ -43,3 +43,4 @@ export type Quote = typeof quotes.$inferSelect;
 export type NewQuote = typeof quotes.$inferInsert;
 export type SurgeHistoryRow = typeof surgeHistory.$inferSelect;
 export type SurgeOverrideRow = typeof surgeOverrides.$inferSelect;
+

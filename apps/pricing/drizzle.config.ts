@@ -11,3 +11,4 @@ export default defineConfig({
       'postgres://hex:hex_dev_only@localhost:5432/pricing',
   },
 });
+

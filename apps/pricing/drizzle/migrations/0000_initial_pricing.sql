@@ -36,3 +36,4 @@ CREATE TABLE "surge_overrides" (
 	"expires_at" timestamp with time zone NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
+

@@ -53,3 +53,4 @@ We need explicit, deterministic trust anomaly detection, circuit breakers on syn
 - Ingest pipeline sheds load gracefully rather than exhausting memory during downstream stalls.
 - Kinematic anomalies are caught with $\ge 90\%$ detection rate and $\le 5\%$ false-positive rate.
 - Inter-service network calls fail fast (503 Service Unavailable) instead of hanging sockets when downstreams are unhealthy.
+

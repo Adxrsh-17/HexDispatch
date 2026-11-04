@@ -63,3 +63,4 @@ describe.skipIf(!dockerAvailable)('Pricing Testcontainers Integration (PostgreSQ
     expect(allQuotes).toEqual([]);
   });
 });
+
