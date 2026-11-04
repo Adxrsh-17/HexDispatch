@@ -17,7 +17,8 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "sim": "pnpm --filter @hexdispatch/simulator start"
+    "sim": "pnpm --filter @hexdispatch/simulator start",
+    "chaos": "tsx tools/chaos/runner.ts"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.15",

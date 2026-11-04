@@ -130,12 +130,12 @@ describe('Payment Saga Chaos Test (AC1 & AC2)', () => {
       // 1. Assert payment status is CAPTURED
       const [payment] = await db.select().from(payments).where(eq(payments.rideId, rideId));
       expect(payment).toBeDefined();
-      expect(payment.status).toBe('CAPTURED');
+      expect(payment!.status).toBe('CAPTURED');
 
       // 2. Assert saga state is COMPLETED
       const [saga] = await db.select().from(paymentSagas).where(eq(paymentSagas.rideId, rideId));
       expect(saga).toBeDefined();
-      expect(saga.state).toBe('COMPLETED');
+      expect(saga!.state).toBe('COMPLETED');
 
       // 3. Assert exactly one CAPTURE record in psp_records (no double-capture!)
       const captures = (
@@ -148,7 +148,7 @@ describe('Payment Saga Chaos Test (AC1 & AC2)', () => {
     for (const rideId of cancelledRides) {
       const [payment] = await db.select().from(payments).where(eq(payments.rideId, rideId));
       expect(payment).toBeDefined();
-      expect(payment.status).toBe('RELEASED');
+      expect(payment!.status).toBe('RELEASED');
     }
   });
 });

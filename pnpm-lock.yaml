@@ -350,6 +350,9 @@ importers:
 
   tools/simulator:
     dependencies:
+      '@hexdispatch/location':
+        specifier: workspace:*
+        version: link:../../apps/location
       '@hexdispatch/matching':
         specifier: workspace:*
         version: link:../../packages/matching

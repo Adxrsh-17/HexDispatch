@@ -5,6 +5,7 @@ import { buildServer, AppError } from '@hexdispatch/shared';
 import type { DriverIndex } from './driver-index';
 import type { NearbySearch } from './nearby';
 import type { LocationBatchPublisher } from './batch-publisher';
+import type { TrustEngine } from './trust/trust-engine';
 import { locationPingSchema, validatePingFreshnessAndSanity } from './validation';
 import type Redis from 'ioredis';
 
@@ -12,6 +13,7 @@ export interface LocationAppOptions {
   driverIndex: DriverIndex;
   nearbySearch: NearbySearch;
   batchPublisher: LocationBatchPublisher;
+  trustEngine?: TrustEngine;
   redisPubSub?: Redis;
   logLevel?: string;
 }
@@ -25,7 +27,7 @@ const nearbyQuerySchema = z.object({
 });
 
 export async function buildLocationApp(options: LocationAppOptions): Promise<FastifyInstance> {
-  const { driverIndex, nearbySearch, batchPublisher, redisPubSub, logLevel } = options;
+  const { driverIndex, nearbySearch, batchPublisher, trustEngine, redisPubSub, logLevel } = options;
 
   const app = buildServer({
     service: 'location',
@@ -40,6 +42,16 @@ export async function buildLocationApp(options: LocationAppOptions): Promise<Fas
     const previous = await driverIndex.getDriver(driverId);
 
     validatePingFreshnessAndSanity(ping, previous);
+
+    // Evaluate trust & safety anomaly detection (Task 1)
+    if (trustEngine) {
+      await trustEngine.evaluateLocationPing(driverId, {
+        lat: ping.lat,
+        lng: ping.lng,
+        status: ping.status,
+        timestampMs: new Date(ping.ts).getTime(),
+      });
+    }
 
     const driverLoc = {
       driverId,
@@ -80,6 +92,31 @@ export async function buildLocationApp(options: LocationAppOptions): Promise<Fas
     const query = nearbyQuerySchema.parse(request.query);
     const candidates = await nearbySearch.findNearby(query);
     return reply.send(candidates);
+  });
+
+  // GET /admin/trust/flags (admin trust audit endpoint)
+  app.get('/admin/trust/flags', async (_request, reply) => {
+    const flags = trustEngine ? trustEngine.getAllFlags() : [];
+    return reply.send({
+      count: flags.length,
+      flags,
+    });
+  });
+
+  // POST /admin/trust/ride-outcome (record ride outcome for cancellation abuse detection)
+  app.post('/admin/trust/ride-outcome', async (request, reply) => {
+    if (!trustEngine) {
+      return reply.code(400).send({ error: 'TrustEngine not enabled' });
+    }
+    const outcomeSchema = z.object({
+      subjectId: z.string().uuid(),
+      subjectType: z.enum(['DRIVER', 'RIDER']),
+      isCancelled: z.boolean(),
+      timestampMs: z.number().optional(),
+    });
+    const parsed = outcomeSchema.parse(request.body);
+    const result = await trustEngine.recordRideOutcome(parsed);
+    return reply.send(result);
   });
 
   // WebSocket Location Ingest: /drivers/me/location/ws

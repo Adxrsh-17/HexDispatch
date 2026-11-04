@@ -9,6 +9,7 @@ import {
   type LatLng,
 } from '@hexdispatch/matching';
 import { computeSurgeStep } from '@hexdispatch/pricing/surge-engine';
+import { TrustEngine } from '@hexdispatch/location/trust';
 import { cellToLatLng, gridDisk, latLngToCell } from 'h3-js';
 import { DiscreteEngine } from './engine/discrete-engine';
 import {
@@ -45,6 +46,23 @@ interface ActiveRide {
   surgeMultiplier?: number;
 }
 
+export interface InjectedAnomaly {
+  id: string;
+  type: 'IMPOSSIBLE_SPEED' | 'TELEPORT_JUMP' | 'FROZEN_GPS' | 'CANCELLATION_ABUSE';
+  subjectId: string;
+  timeSec: number;
+}
+
+export interface AnomalyReport {
+  totalInjected: number;
+  detectedCount: number;
+  truePositives: number;
+  falsePositives: number;
+  detectionRate: number;
+  falsePositiveRate: number;
+  injected: InjectedAnomaly[];
+}
+
 export interface SimulationResult {
   scenario: ScenarioConfig;
   policy: MatchingPolicy;
@@ -52,6 +70,7 @@ export interface SimulationResult {
   metrics: SimMetrics;
   drivers: readonly SimDriver[];
   collector: MetricsCollector;
+  anomalies?: AnomalyReport;
 }
 
 export class CitySimulator {
@@ -72,6 +91,10 @@ export class CitySimulator {
   readonly batchWindowSec: number;
   readonly isSurgeEnabled: boolean;
   readonly surgeIntervalSec: number;
+  readonly injectAnomalies: boolean;
+  private trustEngine?: TrustEngine;
+  private groundTruthAnomalies: InjectedAnomaly[] = [];
+  private normalEventsCount = 0;
   private surgeMultipliers = new Map<string, number>();
   private demandEvents: Array<{ timeSec: number; cell: string }> = [];
   private prevSurgeState = new Map<
@@ -85,6 +108,7 @@ export class CitySimulator {
     policy?: MatchingPolicy,
     batchWindowSec = 2,
     surgeEnabled?: boolean,
+    injectAnomalies = false,
   ) {
     this.rng = new RngManager(seed);
     this.city = new CityModel(scenario.city);
@@ -94,6 +118,17 @@ export class CitySimulator {
     this.batchWindowSec = batchWindowSec;
     this.isSurgeEnabled = surgeEnabled ?? scenario.surge?.enabled ?? false;
     this.surgeIntervalSec = scenario.surge?.updateIntervalSec ?? 30;
+    this.injectAnomalies = injectAnomalies;
+
+    if (this.injectAnomalies) {
+      this.trustEngine = new TrustEngine({
+        maxSpeedMps: 42,
+        teleportDistanceMeters: 500,
+        frozenGpsThresholdSec: 300,
+        cancellationThresholdCount: 4,
+        cancellationWindowSec: 3600,
+      });
+    }
 
     this.offerTimeoutSec = scenario.matching?.offerTimeoutSec ?? 15;
     this.maxOfferAttempts = scenario.matching?.maxOfferAttempts ?? 3;
@@ -205,6 +240,34 @@ export class CitySimulator {
     // H3 res 8 cell for pickup
     const pickupCell = latLngToCell(pickup.lat, pickup.lng, 8);
     this.demandEvents.push({ timeSec: event.time, cell: pickupCell });
+
+    if (this.injectAnomalies && this.trustEngine) {
+      if (this.rng.demand.nextFloat(0, 1) < 0.03) {
+        const anomalyId = `anom-${this.groundTruthAnomalies.length + 1}`;
+        this.groundTruthAnomalies.push({
+          id: anomalyId,
+          type: 'CANCELLATION_ABUSE',
+          subjectId: rideId,
+          timeSec: event.time,
+        });
+        for (let i = 0; i < 4; i++) {
+          void this.trustEngine.recordRideOutcome({
+            subjectId: rideId,
+            subjectType: 'RIDER',
+            isCancelled: true,
+            timestampMs: (event.time + i * 30) * 1000,
+          });
+        }
+      } else {
+        void this.trustEngine.recordRideOutcome({
+          subjectId: rideId,
+          subjectType: 'RIDER',
+          isCancelled: false,
+          timestampMs: event.time * 1000,
+        });
+        this.normalEventsCount += 1;
+      }
+    }
 
     const surgeMultiplier = this.isSurgeEnabled
       ? (this.surgeMultipliers.get(pickupCell) ?? 1.0)
@@ -590,6 +653,41 @@ export class CitySimulator {
     if (!ride || !driver) return;
 
     driver.transitionStatus('ON_TRIP', event.time);
+
+    if (this.injectAnomalies && this.trustEngine) {
+      if (this.rng.driver.nextFloat(0, 1) < 0.05) {
+        const anomalyId = `anom-${this.groundTruthAnomalies.length + 1}`;
+        this.groundTruthAnomalies.push({
+          id: anomalyId,
+          type: 'FROZEN_GPS',
+          subjectId: driver.id,
+          timeSec: event.time,
+        });
+
+        const baseMs = event.time * 1000;
+        void this.trustEngine.evaluateLocationPing(driver.id, {
+          lat: ride.pickup.lat,
+          lng: ride.pickup.lng,
+          status: 'ON_TRIP',
+          timestampMs: baseMs,
+        });
+        void this.trustEngine.evaluateLocationPing(driver.id, {
+          lat: ride.pickup.lat,
+          lng: ride.pickup.lng,
+          status: 'ON_TRIP',
+          timestampMs: baseMs + 320_000,
+        });
+      } else {
+        void this.trustEngine.evaluateLocationPing(driver.id, {
+          lat: ride.pickup.lat,
+          lng: ride.pickup.lng,
+          status: 'ON_TRIP',
+          timestampMs: event.time * 1000,
+        });
+        this.normalEventsCount += 1;
+      }
+    }
+
     const tripDurationSec = this.city.getTravelTimeSec(ride.pickup, ride.dropoff);
 
     this.engine.schedule<TripCompletePayload>('TRIP_COMPLETE', tripDurationSec, {
@@ -682,6 +780,38 @@ export class CitySimulator {
 
     driver.roam(this.city, this.rng.driver, event.time, biasTarget);
 
+    if (this.injectAnomalies && this.trustEngine) {
+      if (this.rng.driver.nextFloat(0, 1) < 0.04) {
+        const isTeleport = this.rng.driver.nextFloat(0, 1) < 0.5;
+        const anomalyType = isTeleport ? 'TELEPORT_JUMP' : 'IMPOSSIBLE_SPEED';
+        const anomalyId = `anom-${this.groundTruthAnomalies.length + 1}`;
+        this.groundTruthAnomalies.push({
+          id: anomalyId,
+          type: anomalyType,
+          subjectId: driver.id,
+          timeSec: event.time,
+        });
+
+        const offset = isTeleport ? 0.04 : 0.015;
+        const badPing = {
+          lat: driver.location.lat + offset,
+          lng: driver.location.lng + offset,
+          status: 'AVAILABLE' as const,
+          timestampMs: (event.time + 2) * 1000,
+        };
+        void this.trustEngine.evaluateLocationPing(driver.id, badPing);
+      } else {
+        const normalPing = {
+          lat: driver.location.lat,
+          lng: driver.location.lng,
+          status: 'AVAILABLE' as const,
+          timestampMs: event.time * 1000,
+        };
+        void this.trustEngine.evaluateLocationPing(driver.id, normalPing);
+        this.normalEventsCount += 1;
+      }
+    }
+
     // Periodic roaming check every 60-120 seconds
     const nextRoam = this.rng.driver.nextFloat(60, 120);
     this.engine.schedule<DriverRoamPayload>('DRIVER_ROAM', nextRoam, { driverId });
@@ -712,6 +842,42 @@ export class CitySimulator {
     const driversList = Array.from(this.drivers.values());
     const metrics = this.collector.calculate(driversList, this.scenario.durationSec);
 
+    let anomalyReport: AnomalyReport | undefined;
+    if (this.injectAnomalies && this.trustEngine) {
+      const allFlags = this.trustEngine.getAllFlags();
+      const flaggedSubjectIds = new Set(allFlags.map((f) => f.subjectId));
+      const injectedSubjectIds = new Set(this.groundTruthAnomalies.map((a) => a.subjectId));
+
+      let truePositives = 0;
+      for (const injected of this.groundTruthAnomalies) {
+        if (flaggedSubjectIds.has(injected.subjectId)) {
+          truePositives += 1;
+        }
+      }
+
+      let falsePositives = 0;
+      for (const flag of allFlags) {
+        if (!injectedSubjectIds.has(flag.subjectId)) {
+          falsePositives += 1;
+        }
+      }
+
+      const totalInjected = this.groundTruthAnomalies.length;
+      const detectionRate = totalInjected > 0 ? (truePositives / totalInjected) * 100 : 100;
+      const falsePositiveRate =
+        this.normalEventsCount > 0 ? (falsePositives / this.normalEventsCount) * 100 : 0;
+
+      anomalyReport = {
+        totalInjected,
+        detectedCount: allFlags.length,
+        truePositives,
+        falsePositives,
+        detectionRate: Number(detectionRate.toFixed(1)),
+        falsePositiveRate: Number(falsePositiveRate.toFixed(2)),
+        injected: this.groundTruthAnomalies,
+      };
+    }
+
     return {
       scenario: this.scenario,
       policy: this.policy,
@@ -719,6 +885,7 @@ export class CitySimulator {
       metrics,
       drivers: driversList,
       collector: this.collector,
+      anomalies: anomalyReport,
     };
   }
 }

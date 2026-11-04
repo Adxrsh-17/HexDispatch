@@ -96,6 +96,21 @@ export const rideMatchedPayload = z.object({
   batchId: z.string().uuid().nullable().optional(),
 });
 
+export const trustFlaggedPayload = z.object({
+  subjectId: z.string(),
+  subjectType: z.enum(['DRIVER', 'RIDER']),
+  reason: z.enum([
+    'IMPOSSIBLE_SPEED',
+    'TELEPORT_JUMP',
+    'FROZEN_GPS',
+    'ROUTE_DEVIATION',
+    'CANCELLATION_ABUSE',
+  ]),
+  riskScore: z.number().min(0).max(100),
+  details: z.record(z.unknown()).optional(),
+  flaggedAt: z.string().datetime(),
+});
+
 export const rideRequestedEvent = eventEnvelope(TOPICS.RIDE_REQUESTED, rideRequestedPayload);
 export const tripStateChangedEvent = eventEnvelope(
   TOPICS.TRIP_STATE_CHANGED,
@@ -111,6 +126,7 @@ export const offerSentEvent = eventEnvelope(TOPICS.OFFER_SENT, offerSentPayload)
 export const offerDeclinedEvent = eventEnvelope(TOPICS.OFFER_DECLINED, offerDeclinedPayload);
 export const offerExpiredEvent = eventEnvelope(TOPICS.OFFER_EXPIRED, offerExpiredPayload);
 export const rideMatchedEvent = eventEnvelope(TOPICS.RIDE_MATCHED, rideMatchedPayload);
+export const trustFlaggedEvent = eventEnvelope(TOPICS.TRUST_FLAGGED, trustFlaggedPayload);
 
 export type RideRequestedEvent = z.infer<typeof rideRequestedEvent>;
 export type TripStateChangedEvent = z.infer<typeof tripStateChangedEvent>;
@@ -121,3 +137,4 @@ export type OfferSentEvent = z.infer<typeof offerSentEvent>;
 export type OfferDeclinedEvent = z.infer<typeof offerDeclinedEvent>;
 export type OfferExpiredEvent = z.infer<typeof offerExpiredEvent>;
 export type RideMatchedEvent = z.infer<typeof rideMatchedEvent>;
+export type TrustFlaggedEvent = z.infer<typeof trustFlaggedEvent>;

@@ -5,5 +5,6 @@ export * from './server';
 export * from './crypto';
 export * from './jwt';
 export * from './rate-limiter';
+export * from './circuit-breaker';
 export * from './kafka';
 export * from './db';

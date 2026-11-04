@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { TOPICS, type LocationUpdatedEvent } from '@hexdispatch/contracts';
 import type { KafkaProducer } from '@hexdispatch/shared';
-import { Counter, Histogram, register, type Registry } from 'prom-client';
+import { Counter, Gauge, Histogram, register, type Registry } from 'prom-client';
 import type { DriverLocation } from './driver-index';
 
 export interface BatchPublisherOptions {
   batchSize?: number;
   flushIntervalMs?: number;
+  maxQueueSize?: number;
   registry?: Registry;
 }
 
@@ -14,6 +15,8 @@ export interface LocationMetrics {
   pingsTotal: Counter<string>;
   batchSizeHistogram: Histogram<string>;
   ingestDuration: Histogram<string>;
+  droppedTotal: Counter<string>;
+  overloadGauge: Gauge<string>;
 }
 
 export function createLocationMetrics(registry?: Registry): LocationMetrics {
@@ -46,7 +49,23 @@ export function createLocationMetrics(registry?: Registry): LocationMetrics {
       registers: [targetReg],
     });
 
-  return { pingsTotal, batchSizeHistogram, ingestDuration };
+  const droppedTotal =
+    (targetReg.getSingleMetric('location_dropped_total') as Counter<string>) ??
+    new Counter({
+      name: 'location_dropped_total',
+      help: 'Total number of location pings dropped due to backpressure and overload shedding',
+      registers: [targetReg],
+    });
+
+  const overloadGauge =
+    (targetReg.getSingleMetric('location_ingest_overloaded') as Gauge<string>) ??
+    new Gauge({
+      name: 'location_ingest_overloaded',
+      help: 'Gauge indicating 1 when location ingest queue is overloaded, 0 otherwise',
+      registers: [targetReg],
+    });
+
+  return { pingsTotal, batchSizeHistogram, ingestDuration, droppedTotal, overloadGauge };
 }
 
 export class LocationBatchPublisher {
@@ -60,6 +79,7 @@ export class LocationBatchPublisher {
   private timer: NodeJS.Timeout | null = null;
   private batchSize: number;
   private flushIntervalMs: number;
+  private maxQueueSize: number;
   private metrics: LocationMetrics;
 
   constructor(
@@ -68,6 +88,7 @@ export class LocationBatchPublisher {
   ) {
     this.batchSize = options.batchSize ?? 50;
     this.flushIntervalMs = options.flushIntervalMs ?? 200;
+    this.maxQueueSize = options.maxQueueSize ?? 500;
     this.metrics = createLocationMetrics(options.registry);
     this.startTimer();
   }
@@ -81,6 +102,14 @@ export class LocationBatchPublisher {
 
   async enqueue(loc: DriverLocation, correlationId: string = randomUUID()): Promise<void> {
     return new Promise((resolve, reject) => {
+      // Overload shedding / backpressure (Task 4 & AC4)
+      if (this.queue.length >= this.maxQueueSize) {
+        this.metrics.droppedTotal.inc();
+        this.metrics.overloadGauge.set(1);
+        resolve(); // resolve without crashing
+        return;
+      }
+
       this.queue.push({ loc, correlationId, resolve, reject });
       this.metrics.pingsTotal.labels(loc.status).inc();
 
@@ -95,6 +124,11 @@ export class LocationBatchPublisher {
 
     const currentBatch = this.queue.splice(0, this.batchSize);
     const count = currentBatch.length;
+
+    if (this.queue.length < this.maxQueueSize * 0.8) {
+      this.metrics.overloadGauge.set(0);
+    }
+
     this.metrics.batchSizeHistogram.observe(count);
 
     const messages = currentBatch.map(({ loc, correlationId }) => {

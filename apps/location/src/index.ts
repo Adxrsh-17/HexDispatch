@@ -4,6 +4,7 @@ import { loadServiceEnv, startServer, KafkaProducer } from '@hexdispatch/shared'
 import { DriverIndex } from './driver-index';
 import { NearbySearch } from './nearby';
 import { LocationBatchPublisher } from './batch-publisher';
+import { TrustEngine } from './trust/trust-engine';
 import { buildLocationApp } from './app';
 
 const env = loadServiceEnv('LOCATION_PORT', 3002);
@@ -25,6 +26,9 @@ const producer = new KafkaProducer(kafka, undefined);
 
 const driverIndex = new DriverIndex(redis);
 const nearbySearch = new NearbySearch(driverIndex);
+const trustEngine = new TrustEngine({
+  producer,
+});
 const batchPublisher = new LocationBatchPublisher(producer, {
   batchSize: 50,
   flushIntervalMs: 200,
@@ -34,6 +38,7 @@ const app = await buildLocationApp({
   driverIndex,
   nearbySearch,
   batchPublisher,
+  trustEngine,
   redisPubSub: redis,
   logLevel: env.LOG_LEVEL,
 });

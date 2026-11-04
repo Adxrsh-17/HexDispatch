@@ -4,24 +4,24 @@
   <text x="300" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#0f172a">Pickup ETA Distribution (Seconds)</text>
   <line x1="40" y1="250" x2="560" y2="250" stroke="#cbd5e1" stroke-width="2" />
   
-        <rect x="60" y="120" width="60" height="130" fill="#2563eb" rx="4" />
-        <text x="90" y="112" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">75</text>
+        <rect x="60" y="82" width="60" height="168" fill="#2563eb" rx="4" />
+        <text x="90" y="74" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">91</text>
         <text x="90" y="270" text-anchor="middle" font-size="12" fill="#64748b"><2m</text>
       
-        <rect x="150" y="66" width="60" height="184" fill="#2563eb" rx="4" />
-        <text x="180" y="58" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">106</text>
+        <rect x="150" y="58" width="60" height="192" fill="#2563eb" rx="4" />
+        <text x="180" y="50" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">104</text>
         <text x="180" y="270" text-anchor="middle" font-size="12" fill="#64748b">2-4m</text>
       
-        <rect x="240" y="66" width="60" height="184" fill="#2563eb" rx="4" />
-        <text x="270" y="58" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">106</text>
+        <rect x="240" y="30" width="60" height="220" fill="#2563eb" rx="4" />
+        <text x="270" y="22" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">119</text>
         <text x="270" y="270" text-anchor="middle" font-size="12" fill="#64748b">4-6m</text>
       
-        <rect x="330" y="30" width="60" height="220" fill="#2563eb" rx="4" />
-        <text x="360" y="22" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">127</text>
+        <rect x="330" y="36" width="60" height="214" fill="#2563eb" rx="4" />
+        <text x="360" y="28" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">116</text>
         <text x="360" y="270" text-anchor="middle" font-size="12" fill="#64748b">6-8m</text>
       
-        <rect x="420" y="58" width="60" height="192" fill="#2563eb" rx="4" />
-        <text x="450" y="50" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">111</text>
+        <rect x="420" y="43" width="60" height="207" fill="#2563eb" rx="4" />
+        <text x="450" y="35" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="bold">112</text>
         <text x="450" y="270" text-anchor="middle" font-size="12" fill="#64748b">8-10m</text>
       
         <rect x="510" y="250" width="60" height="0" fill="#2563eb" rx="4" />

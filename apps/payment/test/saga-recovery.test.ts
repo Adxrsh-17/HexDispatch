@@ -51,7 +51,7 @@ describe('Payment Saga Mid-Crash Recovery (AC4)', () => {
     // Verify payment is now AUTHORIZED
     const [payment] = await db.select().from(payments).where(eq(payments.rideId, rideId));
     expect(payment).toBeDefined();
-    expect(payment.status).toBe('AUTHORIZED');
+    expect(payment!.status).toBe('AUTHORIZED');
 
     // Run recovery again (idempotent resume check)
     const resumedAgain = await sagaService.resumePendingSagas();
@@ -86,11 +86,13 @@ describe('Payment Saga Mid-Crash Recovery (AC4)', () => {
 
     // Verify payment is CAPTURED
     const [payment] = await db.select().from(payments).where(eq(payments.rideId, rideId));
-    expect(payment.status).toBe('CAPTURED');
+    expect(payment).toBeDefined();
+    expect(payment!.status).toBe('CAPTURED');
 
     // Verify saga is COMPLETED
     const [saga] = await db.select().from(paymentSagas).where(eq(paymentSagas.rideId, rideId));
-    expect(saga.state).toBe('COMPLETED');
+    expect(saga).toBeDefined();
+    expect(saga!.state).toBe('COMPLETED');
 
     // Verify exactly one CAPTURE in psp_records
     const captures = (
