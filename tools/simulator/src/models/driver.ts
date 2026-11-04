@@ -108,6 +108,7 @@ export class SimDriver {
     pickup: LatLng,
     dropoff: LatLng,
     timeSec: number,
+    surgeMultiplier = 1.0,
   ): { fareCents: number; tripDistanceMeters: number } {
     const tripDist = haversineMeters(pickup, dropoff);
     this.totalDistanceMeters += tripDist;
@@ -116,7 +117,8 @@ export class SimDriver {
     // Standard stub fare: $5.00 base + $1.50/km ($0.0015/m)
     const baseCents = 500;
     const distanceCents = Math.round((tripDist / 1000) * 150);
-    const fareCents = baseCents + distanceCents;
+    const subtotal = baseCents + distanceCents;
+    const fareCents = Math.round(subtotal * surgeMultiplier);
 
     this.totalEarningsCents += fareCents;
     this.completedTrips += 1;
@@ -130,21 +132,24 @@ export class SimDriver {
   /**
    * Idle roaming: step ~150-300m towards closest hotspot or roam randomly.
    */
-  roam(city: CityModel, driverRng: SeededRng, timeSec: number): void {
+  roam(city: CityModel, driverRng: SeededRng, timeSec: number, biasTarget?: LatLng): void {
     if (this.status !== 'IDLE') return;
 
     const elapsed = Math.max(0, timeSec - this.statusChangedAtSec);
     this.totalIdleTimeSec += elapsed;
     this.statusChangedAtSec = timeSec;
 
-    let target = city.center;
-    // Find closest hotspot to drift towards
-    let minDist = Infinity;
-    for (const h of city.hotspots) {
-      const d = haversineMeters(this.location, h.center);
-      if (d < minDist) {
-        minDist = d;
-        target = h.center;
+    let target = biasTarget;
+    if (!target) {
+      target = city.center;
+      // Find closest hotspot to drift towards
+      let minDist = Infinity;
+      for (const h of city.hotspots) {
+        const d = haversineMeters(this.location, h.center);
+        if (d < minDist) {
+          minDist = d;
+          target = h.center;
+        }
       }
     }
 

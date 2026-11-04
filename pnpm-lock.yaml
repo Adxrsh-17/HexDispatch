@@ -221,9 +221,39 @@ importers:
 
   apps/pricing:
     dependencies:
+      '@hexdispatch/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@hexdispatch/matching':
+        specifier: workspace:*
+        version: link:../../packages/matching
       '@hexdispatch/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      drizzle-orm:
+        specifier: ^0.45.4
+        version: 0.45.4(@electric-sql/pglite@0.5.15)(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1)(postgres@4.0.0)
+      fastify:
+        specifier: ^5.2.0
+        version: 5.12.8
+      fastify-type-provider-zod:
+        specifier: ^4.0.2
+        version: 4.0.2(fastify@5.12.8)(zod@3.25.76)
+      h3-js:
+        specifier: ^4.5.0
+        version: 4.5.0
+      ioredis:
+        specifier: ^6.0.0
+        version: 6.0.0
+      kafkajs:
+        specifier: ^2.2.4
+        version: 2.2.4
+      prom-client:
+        specifier: ^15.1.3
+        version: 15.1.3
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
 
   packages/contracts:
     dependencies:
@@ -289,6 +319,9 @@ importers:
       '@hexdispatch/matching':
         specifier: workspace:*
         version: link:../../packages/matching
+      '@hexdispatch/pricing':
+        specifier: workspace:*
+        version: link:../../apps/pricing
       h3-js:
         specifier: ^4.5.0
         version: 4.5.0

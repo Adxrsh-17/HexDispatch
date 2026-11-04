@@ -29,6 +29,7 @@ interface ParsedArgs {
   seed: number;
   duration?: number;
   window: number;
+  surge?: boolean;
   outDir: string;
   writeFiles: boolean;
 }
@@ -40,6 +41,7 @@ function parseCliArgs(argv: string[]): ParsedArgs {
   let seed = 42;
   let duration: number | undefined;
   let window = 2;
+  let surge: boolean | undefined;
   let outDir = path.resolve(__dirname, '../../../docs/benchmarks');
   let writeFiles = true;
 
@@ -55,6 +57,10 @@ function parseCliArgs(argv: string[]): ParsedArgs {
       duration = Number.parseInt(args[++i]!, 10);
     } else if (arg === '--window' && args[i + 1]) {
       window = Number.parseFloat(args[++i]!);
+    } else if (arg === '--surge') {
+      surge = true;
+    } else if (arg === '--no-surge') {
+      surge = false;
     } else if (arg === '--out' && args[i + 1]) {
       outDir = path.resolve(process.cwd(), args[++i]!);
     } else if (arg === '--no-write') {
@@ -62,7 +68,7 @@ function parseCliArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  return { scenario, policy, seed, duration, window, outDir, writeFiles };
+  return { scenario, policy, seed, duration, window, surge, outDir, writeFiles };
 }
 
 function loadScenario(name: string): ScenarioConfig {
@@ -104,7 +110,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   console.log(`Policy: ${policy.name} | Seed: ${parsed.seed} | Duration: ${scenario.durationSec}s`);
   console.log('====================================================');
 
-  const sim = new CitySimulator(scenario, parsed.seed, policy, parsed.window);
+  const sim = new CitySimulator(scenario, parsed.seed, policy, parsed.window, parsed.surge);
   const startMs = Date.now();
   const result = sim.run();
   const elapsedMs = Date.now() - startMs;
@@ -119,6 +125,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   console.log(
     `Unmatched:         ${metrics.unmatchedRides} (${(metrics.noDriverRate * 100).toFixed(1)}%)`,
   );
+  if (metrics.surgeAbandonedRides !== undefined && metrics.surgeAbandonedRides > 0) {
+    console.log(
+      `Surge Abandoned:   ${metrics.surgeAbandonedRides} (${((metrics.surgeAbandonedRides / metrics.totalRequests) * 100).toFixed(1)}%)`,
+    );
+  }
   console.log(
     `Pickup ETA Avg:    ${Math.round(metrics.pickupEtaAvgSec)}s (~${(metrics.pickupEtaAvgSec / 60).toFixed(1)} min)`,
   );

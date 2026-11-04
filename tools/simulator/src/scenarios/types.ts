@@ -15,6 +15,13 @@ export interface MatchingSettings {
   offerTimeoutSec?: number;
 }
 
+export interface SurgeSimulatorConfig {
+  enabled: boolean;
+  updateIntervalSec?: number;
+  priceElasticity?: number;
+  driverRepositionBias?: number;
+}
+
 export interface ScenarioConfig {
   name: string;
   description: string;
@@ -23,4 +30,5 @@ export interface ScenarioConfig {
   demand: DemandConfig;
   drivers: DriverFleetConfig;
   matching?: Partial<MatchingSettings>;
+  surge?: Partial<SurgeSimulatorConfig>;
 }

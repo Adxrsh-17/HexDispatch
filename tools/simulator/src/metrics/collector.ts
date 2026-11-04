@@ -19,7 +19,7 @@ export interface UnmatchedRideRecord {
   rideId: string;
   requestedAtSec: number;
   attempts: number;
-  reason: 'NO_DRIVER_FOUND' | 'MAX_ATTEMPTS_EXCEEDED' | 'TIMEOUT';
+  reason: 'NO_DRIVER_FOUND' | 'MAX_ATTEMPTS_EXCEEDED' | 'TIMEOUT' | 'PRICE_SURGE_ABANDONED';
 }
 
 export interface SimMetrics {
@@ -27,6 +27,7 @@ export interface SimMetrics {
   matchedRides: number;
   completedRides: number;
   unmatchedRides: number;
+  surgeAbandonedRides: number;
   cancelledRides: number;
 
   matchRate: number; // completedRides / totalRequests
@@ -74,6 +75,9 @@ export class MetricsCollector {
     const totalRequests = this.totalRequestsCount;
     const completedCount = this.completedRides.length;
     const unmatchedCount = this.unmatchedRides.length;
+    const surgeAbandonedRides = this.unmatchedRides.filter(
+      (r) => r.reason === 'PRICE_SURGE_ABANDONED',
+    ).length;
 
     const matchRate = totalRequests > 0 ? completedCount / totalRequests : 0;
     const noDriverRate = totalRequests > 0 ? unmatchedCount / totalRequests : 0;
@@ -124,6 +128,7 @@ export class MetricsCollector {
       matchedRides: completedCount,
       completedRides: completedCount,
       unmatchedRides: unmatchedCount,
+      surgeAbandonedRides,
       cancelledRides: this.cancelledCount,
       matchRate: Number(matchRate.toFixed(4)),
       noDriverRate: Number(noDriverRate.toFixed(4)),

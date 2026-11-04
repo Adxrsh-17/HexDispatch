@@ -8,11 +8,14 @@ import {
   haversineMeters,
   type LatLng,
 } from '@hexdispatch/matching';
+import { computeSurgeStep } from '@hexdispatch/pricing/surge-engine';
+import { cellToLatLng, gridDisk, latLngToCell } from 'h3-js';
 import { DiscreteEngine } from './engine/discrete-engine';
 import {
   type SimEvent,
   type RideRequestedPayload,
   type MatchCyclePayload,
+  type SurgeCyclePayload,
   type RetryMatchPayload,
   type OfferEvaluatePayload,
   type OfferTimeoutPayload,
@@ -39,6 +42,7 @@ interface ActiveRide {
   attempts: number;
   excludedDrivers: Set<string>;
   activeOfferId?: string;
+  surgeMultiplier?: number;
 }
 
 export interface SimulationResult {
@@ -66,12 +70,21 @@ export class CitySimulator {
   private nextRideId = 0;
   readonly isBatched: boolean;
   readonly batchWindowSec: number;
+  readonly isSurgeEnabled: boolean;
+  readonly surgeIntervalSec: number;
+  private surgeMultipliers = new Map<string, number>();
+  private demandEvents: Array<{ timeSec: number; cell: string }> = [];
+  private prevSurgeState = new Map<
+    string,
+    { smoothedDemand: number; smoothedSupply: number; multiplier: number }
+  >();
 
   constructor(
     readonly scenario: ScenarioConfig,
     readonly seed: number,
     policy?: MatchingPolicy,
     batchWindowSec = 2,
+    surgeEnabled?: boolean,
   ) {
     this.rng = new RngManager(seed);
     this.city = new CityModel(scenario.city);
@@ -79,6 +92,8 @@ export class CitySimulator {
     this.policy = policy ?? new GreedyPolicy();
     this.isBatched = this.policy.name === 'batched';
     this.batchWindowSec = batchWindowSec;
+    this.isSurgeEnabled = surgeEnabled ?? scenario.surge?.enabled ?? false;
+    this.surgeIntervalSec = scenario.surge?.updateIntervalSec ?? 30;
 
     this.offerTimeoutSec = scenario.matching?.offerTimeoutSec ?? 15;
     this.maxOfferAttempts = scenario.matching?.maxOfferAttempts ?? 3;
@@ -97,7 +112,12 @@ export class CitySimulator {
       this.handleMatchCycle(event);
     });
 
-    // 3. RETRY_MATCH
+    // 3. SURGE_CYCLE (for dynamic pricing and surge)
+    this.engine.on<SurgeCyclePayload>('SURGE_CYCLE', (event) => {
+      this.handleSurgeCycle(event);
+    });
+
+    // 4. RETRY_MATCH
     this.engine.on<RetryMatchPayload>('RETRY_MATCH', (event) => {
       const ride = this.activeRides.get(event.payload.rideId);
       if (ride && !ride.activeOfferId && !ride.assignedDriverId) {
@@ -182,6 +202,31 @@ export class CitySimulator {
     const { rideId, pickup, dropoff } = event.payload;
     this.collector.recordRequest();
 
+    // H3 res 8 cell for pickup
+    const pickupCell = latLngToCell(pickup.lat, pickup.lng, 8);
+    this.demandEvents.push({ timeSec: event.time, cell: pickupCell });
+
+    const surgeMultiplier = this.isSurgeEnabled
+      ? (this.surgeMultipliers.get(pickupCell) ?? 1.0)
+      : 1.0;
+
+    // Price elasticity: probability of abandoning rises with surge
+    // P(abandon) = 1 - exp(-gamma * (surge - 1.0))
+    if (this.isSurgeEnabled && surgeMultiplier > 1.0) {
+      const elasticity = this.scenario.surge?.priceElasticity ?? 1.2;
+      const pAbandon = 1 - Math.exp(-elasticity * (surgeMultiplier - 1.0));
+      if (this.rng.demand.nextFloat(0, 1) < pAbandon) {
+        this.collector.recordUnmatchedRide({
+          rideId,
+          requestedAtSec: event.time,
+          attempts: 0,
+          reason: 'PRICE_SURGE_ABANDONED',
+        });
+        this.scheduleNextRide(event.time);
+        return;
+      }
+    }
+
     const ride: ActiveRide = {
       id: rideId,
       pickup,
@@ -189,6 +234,7 @@ export class CitySimulator {
       requestedAtSec: event.time,
       attempts: 0,
       excludedDrivers: new Set<string>(),
+      surgeMultiplier,
     };
     this.activeRides.set(rideId, ride);
 
@@ -199,6 +245,72 @@ export class CitySimulator {
     // In batched mode: periodic MATCH_CYCLE will process pending batch
     if (!this.isBatched) {
       this.dispatchRide(ride, event.time);
+    }
+  }
+
+  private handleSurgeCycle(event: SimEvent<SurgeCyclePayload>): void {
+    const currentTimeSec = event.time;
+
+    // 1. Sliding window of demand (last 300 seconds / 5 minutes)
+    const windowCutoff = currentTimeSec - 300;
+    this.demandEvents = this.demandEvents.filter((e) => e.timeSec >= windowCutoff);
+
+    const demandPerCell = new Map<string, number>();
+    for (const d of this.demandEvents) {
+      demandPerCell.set(d.cell, (demandPerCell.get(d.cell) ?? 0) + 1);
+    }
+
+    // 2. Count IDLE drivers per H3 res 8 cell
+    const supplyPerCell = new Map<string, number>();
+    for (const d of this.drivers.values()) {
+      if (d.status === 'IDLE') {
+        const dCell = latLngToCell(d.location.lat, d.location.lng, 8);
+        supplyPerCell.set(dCell, (supplyPerCell.get(dCell) ?? 0) + 1);
+      }
+    }
+
+    // 3. Identify all active cells
+    const activeCells = new Set<string>([
+      ...demandPerCell.keys(),
+      ...supplyPerCell.keys(),
+      ...this.surgeMultipliers.keys(),
+    ]);
+
+    // 4. For each cell, compute surge step
+    for (const cell of activeCells) {
+      const demand = demandPerCell.get(cell) ?? 0;
+      const supply = supplyPerCell.get(cell) ?? 0;
+      const prevState = this.prevSurgeState.get(cell);
+
+      const neighbourCells = gridDisk(cell, 1).filter((c) => c !== cell);
+      const neighbourMultipliers = neighbourCells.map(
+        (nCell) => this.surgeMultipliers.get(nCell) ?? 1.0,
+      );
+
+      const step = computeSurgeStep({
+        cell,
+        demand,
+        supply,
+        prevSmoothedDemand: prevState?.smoothedDemand,
+        prevSmoothedSupply: prevState?.smoothedSupply,
+        prevMultiplier: prevState?.multiplier ?? 1.0,
+        neighbourMultipliers,
+      });
+
+      this.surgeMultipliers.set(cell, step.finalMultiplier);
+      this.prevSurgeState.set(cell, {
+        smoothedDemand: step.smoothedDemand,
+        smoothedSupply: step.smoothedSupply,
+        multiplier: step.finalMultiplier,
+      });
+    }
+
+    // Schedule next surge cycle
+    const nextCycleTime = currentTimeSec + event.payload.intervalSec;
+    if (nextCycleTime <= this.scenario.durationSec) {
+      this.engine.scheduleAt<SurgeCyclePayload>('SURGE_CYCLE', nextCycleTime, {
+        intervalSec: event.payload.intervalSec,
+      });
     }
   }
 
@@ -493,7 +605,13 @@ export class CitySimulator {
     const driver = this.drivers.get(driverId);
     if (!ride || !driver) return;
 
-    const { fareCents } = driver.completeTrip(ride.pickup, ride.dropoff, event.time);
+    const surgeMultiplier = ride.surgeMultiplier ?? 1.0;
+    const { fareCents } = driver.completeTrip(
+      ride.pickup,
+      ride.dropoff,
+      event.time,
+      surgeMultiplier,
+    );
 
     this.collector.recordCompletedRide({
       rideId: ride.id,
@@ -534,7 +652,35 @@ export class CitySimulator {
     const driver = this.drivers.get(driverId);
     if (!driver || driver.status !== 'IDLE') return;
 
-    driver.roam(this.city, this.rng.driver, event.time);
+    let biasTarget: LatLng | undefined;
+    if (this.isSurgeEnabled) {
+      const driverCell = latLngToCell(driver.location.lat, driver.location.lng, 8);
+      const currentSurge = this.surgeMultipliers.get(driverCell) ?? 1.0;
+      const neighbors = gridDisk(driverCell, 1);
+
+      let maxSurge = currentSurge;
+      let targetCell: string | undefined;
+
+      for (const nCell of neighbors) {
+        const s = this.surgeMultipliers.get(nCell) ?? 1.0;
+        if (s > maxSurge) {
+          maxSurge = s;
+          targetCell = nCell;
+        }
+      }
+
+      const repositionBias = this.scenario.surge?.driverRepositionBias ?? 0.5;
+      if (
+        targetCell &&
+        maxSurge > currentSurge &&
+        this.rng.driver.nextFloat(0, 1) < repositionBias
+      ) {
+        const [lat, lng] = cellToLatLng(targetCell);
+        biasTarget = { lat, lng };
+      }
+    }
+
+    driver.roam(this.city, this.rng.driver, event.time, biasTarget);
 
     // Periodic roaming check every 60-120 seconds
     const nextRoam = this.rng.driver.nextFloat(60, 120);
@@ -550,6 +696,13 @@ export class CitySimulator {
     if (this.isBatched && this.batchWindowSec > 0) {
       this.engine.scheduleAt<MatchCyclePayload>('MATCH_CYCLE', this.batchWindowSec, {
         windowSec: this.batchWindowSec,
+      });
+    }
+
+    // If surge is enabled, start periodic surge cycles
+    if (this.isSurgeEnabled && this.surgeIntervalSec > 0) {
+      this.engine.scheduleAt<SurgeCyclePayload>('SURGE_CYCLE', this.surgeIntervalSec, {
+        intervalSec: this.surgeIntervalSec,
       });
     }
 

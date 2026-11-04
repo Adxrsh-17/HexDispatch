@@ -165,16 +165,22 @@ function connectWs(gatewayUrl: string, token: string): Promise<WebSocket> {
   });
 }
 
+interface WsMessage {
+  type: string;
+  data?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 function waitForEvent(
   ws: WebSocket,
-  predicate: (msg: Record<string, unknown>) => boolean,
+  predicate: (msg: WsMessage) => boolean,
   timeoutMs = 5000,
-): Promise<Record<string, unknown>> {
+): Promise<WsMessage> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Timeout waiting for event')), timeoutMs);
     const handler = (data: WebSocket.RawData) => {
       try {
-        const parsed = JSON.parse(data.toString()) as Record<string, unknown>;
+        const parsed = JSON.parse(data.toString()) as WsMessage;
         if (predicate(parsed)) {
           clearTimeout(timer);
           ws.off('message', handler);
@@ -305,8 +311,8 @@ export async function runE2ERide(gatewayUrl: string): Promise<void> {
     // 5. Driver receives OFFER_SENT
     console.log('5. Waiting for dispatch matching and OFFER_SENT over WebSocket to driver...');
     const offerEvent = await offerReceivedPromise;
-    console.log(`   Offer received by driver! OfferId: ${offerEvent.data.offerId}`);
-    const offerId = offerEvent.data.offerId as string;
+    const offerId = (offerEvent.data?.offerId ?? '') as string;
+    console.log(`   Offer received by driver! OfferId: ${offerId}`);
 
     // 6. Driver accepts offer
     console.log('6. Driver accepting offer...');
@@ -324,7 +330,7 @@ export async function runE2ERide(gatewayUrl: string): Promise<void> {
     // 7. Rider receives RIDE_MATCHED / ASSIGNED
     console.log('7. Waiting for RIDE_MATCHED event on rider WebSocket...');
     const matchedEvent = await riderMatchedPromise;
-    console.log(`   Rider received match! Driver assigned: ${matchedEvent.data.driverId}`);
+    console.log(`   Rider received match! Driver assigned: ${matchedEvent.data?.driverId}`);
 
     // 8. Driver arrives at pickup
     console.log('8. Driver arrives at pickup...');

@@ -6,6 +6,7 @@ export type EventType =
   | 'DRIVER_OFFLINE'
   | 'RIDE_REQUESTED'
   | 'MATCH_CYCLE'
+  | 'SURGE_CYCLE'
   | 'RETRY_MATCH'
   | 'OFFER_EVALUATE'
   | 'OFFER_TIMEOUT'
@@ -39,6 +40,10 @@ export interface RideRequestedPayload {
 
 export interface MatchCyclePayload {
   windowSec: number;
+}
+
+export interface SurgeCyclePayload {
+  intervalSec: number;
 }
 
 export interface RetryMatchPayload {

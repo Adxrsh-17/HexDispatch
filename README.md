@@ -59,7 +59,7 @@ In Claude Code, run `/phase N` (for example `/phase 0`). One phase at a time; th
 - [x] Phase 3: Baseline dispatch
 - [x] Phase 4: City simulator
 - [x] Phase 5: Batched matching
-- [ ] Phase 6: Pricing and surge
+- [x] Phase 6: Pricing and surge
 - [ ] Phase 7: Payments
 - [ ] Phase 8: Trust and resilience (stretch)
 - [ ] Phase 9: Hardening and showcase
