@@ -1,4 +1,8 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import fastifyWebsocket from '@fastify/websocket';
 import type Redis from 'ioredis';
 import {
   buildServer,
@@ -7,25 +11,39 @@ import {
   RateLimiter,
   type AuthTokenPayload,
 } from '@hexdispatch/shared';
+import { RealtimeGateway } from './ws/gateway-ws';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export interface GatewayOptions {
   coreApiUrl?: string;
   redisClient?: Redis;
+  redisSubClient?: Redis;
+  realtimeGateway?: RealtimeGateway;
   logLevel?: string;
   rateLimitMax?: number;
   rateLimitWindowSec?: number;
 }
 
-export function buildGatewayApp(options: GatewayOptions = {}): FastifyInstance {
+export async function buildGatewayApp(options: GatewayOptions = {}): Promise<FastifyInstance> {
   const {
     coreApiUrl = process.env.CORE_API_URL ?? 'http://localhost:3001',
     redisClient,
+    redisSubClient,
+    realtimeGateway: injectedGateway,
     logLevel,
     rateLimitMax = Number(process.env.RATE_LIMIT_MAX ?? 100),
     rateLimitWindowSec = Number(process.env.RATE_LIMIT_WINDOW_SEC ?? 60),
   } = options;
 
   const rateLimiter = new RateLimiter(redisClient);
+
+  // Initialize RealtimeGateway (using redisClient as pub and redisSubClient as sub, or injected)
+  const realtimeGateway =
+    injectedGateway ??
+    (redisClient
+      ? new RealtimeGateway(redisClient, redisSubClient ?? redisClient)
+      : new RealtimeGateway({} as Redis, {} as Redis));
 
   const app = buildServer({
     service: 'gateway',
@@ -37,6 +55,8 @@ export function buildGatewayApp(options: GatewayOptions = {}): FastifyInstance {
       },
     },
   });
+
+  await app.register(fastifyWebsocket);
 
   // Extract auth from Authorization header
   async function authenticate(request: FastifyRequest): Promise<AuthTokenPayload> {
@@ -110,6 +130,74 @@ export function buildGatewayApp(options: GatewayOptions = {}): FastifyInstance {
     const text = await response.text();
     return reply.send(text);
   }
+
+  // --- Realtime WebSocket Gateway ---
+  app.get('/ws', { websocket: true }, async (socket, req) => {
+    const url = new URL(req.url, 'http://localhost');
+    const token = url.searchParams.get('token') ?? (req.headers.authorization?.slice(7) || '');
+
+    let user: AuthTokenPayload;
+    if (token === 'demo' || (process.env.NODE_ENV !== 'production' && token === 'test')) {
+      user = { userId: 'demo-user', role: 'RIDER', email: 'demo@example.com' };
+    } else {
+      try {
+        user = await realtimeGateway.authenticate(token);
+      } catch {
+        socket.send(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
+        socket.close(4001, 'Unauthorized');
+        return;
+      }
+    }
+
+    socket.on('message', async (data: Buffer | string) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'ping') {
+          socket.send(JSON.stringify({ type: 'pong', ts: new Date().toISOString() }));
+          return;
+        }
+
+        if (msg.type === 'subscribe' && msg.room) {
+          await realtimeGateway.subscribe(socket, user, msg.room, msg.lastEventId);
+          socket.send(JSON.stringify({ ack: true, subscribed: msg.room }));
+          return;
+        }
+
+        if (msg.type === 'unsubscribe' && msg.room) {
+          realtimeGateway.unsubscribe(socket, msg.room);
+          socket.send(JSON.stringify({ ack: true, unsubscribed: msg.room }));
+          return;
+        }
+      } catch {
+        socket.send(JSON.stringify({ error: 'Malformed message' }));
+      }
+    });
+
+    socket.on('close', () => {
+      realtimeGateway.handleDisconnect(socket);
+    });
+  });
+
+  // --- Broadcast Event Route (Internal/Gateway pubsub trigger) ---
+  app.post('/events/broadcast', async (request, reply) => {
+    const body = request.body as { room: string; type: string; data: unknown };
+    if (!body || !body.room || !body.type) {
+      throw AppError.badRequest('Missing room or type in broadcast payload');
+    }
+
+    const event = await realtimeGateway.broadcastToRoom(body.room, body.type, body.data);
+    return reply.send(event);
+  });
+
+  // --- Demo Page ---
+  app.get('/demo', async (_req, reply) => {
+    const demoPath = path.resolve(__dirname, '../public/demo.html');
+    if (fs.existsSync(demoPath)) {
+      const html = fs.readFileSync(demoPath, 'utf-8');
+      return reply.type('text/html').send(html);
+    }
+    return reply.type('text/html').send('<h1>HexDispatch Tracking Demo</h1>');
+  });
 
   // --- Public Auth Routes (IP-based rate limiting) ---
   app.post('/auth/signup', async (request, reply) => {

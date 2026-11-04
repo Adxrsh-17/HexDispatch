@@ -8,4 +8,3 @@ export default defineConfig({
     url: process.env.DATABASE_URL ?? 'postgres://hex:hex_dev_only@localhost:5432/core',
   },
 });
-

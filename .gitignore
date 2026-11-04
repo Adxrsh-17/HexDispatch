@@ -8,4 +8,5 @@ coverage/
 *.log
 # simulator output (committed benchmark reports live in docs/benchmarks)
 tools/simulator/out/
+tools/bin/
 .claude/settings.local.json

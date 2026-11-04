@@ -9,6 +9,18 @@
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
-    "@hexdispatch/shared": "workspace:*"
+    "@fastify/websocket": "^11.3.6",
+    "@hexdispatch/contracts": "workspace:*",
+    "@hexdispatch/matching": "workspace:*",
+    "@hexdispatch/shared": "workspace:*",
+    "fastify": "^5.2.0",
+    "h3-js": "^4.5.0",
+    "ioredis": "^6.0.0",
+    "kafkajs": "^2.2.4",
+    "prom-client": "^15.1.3",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.14"
   }
 }

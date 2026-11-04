@@ -29,7 +29,7 @@ describe('Gateway Security & Rate Limiting (AC4)', () => {
     await mockCoreApi.listen({ host: '127.0.0.1', port: CORE_PORT });
 
     // Initialize Gateway pointing to mock Core API, with rateLimitMax = 3
-    gatewayApp = buildGatewayApp({
+    gatewayApp = await buildGatewayApp({
       coreApiUrl: `http://127.0.0.1:${CORE_PORT}`,
       rateLimitMax: 3,
       rateLimitWindowSec: 30,
