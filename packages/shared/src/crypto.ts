@@ -16,3 +16,4 @@ export function hashPayload(payload: unknown): string {
   const serialized = typeof payload === 'string' ? payload : JSON.stringify(payload ?? null);
   return createHash('sha256').update(serialized).digest('hex');
 }
+

@@ -8,3 +8,4 @@ export function getCoreDb(connectionString = process.env.DATABASE_URL ?? CORE_DB
 }
 
 export * from './schema';
+
