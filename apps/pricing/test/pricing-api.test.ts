@@ -209,4 +209,3 @@ describe('Pricing Service & REST API (AC1 & AC4)', () => {
     expect(payload.multiplier).toBeGreaterThanOrEqual(1.0);
   });
 });
-

@@ -82,4 +82,3 @@ describe.skipIf(!dockerAvailable)('Payment Testcontainers Integration (PostgreSQ
     expect(res.json().payment.status).toBe('CAPTURED');
   });
 });
-
