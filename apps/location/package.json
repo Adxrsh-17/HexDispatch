@@ -1,0 +1,14 @@
+{
+  "name": "@hexdispatch/location",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@hexdispatch/shared": "workspace:*"
+  }
+}

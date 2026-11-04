@@ -1,0 +1,6 @@
+{
+  "name": "@hexdispatch/load-tests",
+  "version": "0.0.0",
+  "private": true,
+  "description": "k6 scripts. k6 is a standalone binary, not an npm dependency. Real tests arrive in Phases 2 and 9."
+}

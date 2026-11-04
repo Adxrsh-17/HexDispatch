@@ -1,0 +1,14 @@
+{
+  "name": "@hexdispatch/simulator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Seeded city simulator. Runs the same packages/matching code as production. Implemented in Phase 4.",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@hexdispatch/matching": "workspace:*"
+  }
+}

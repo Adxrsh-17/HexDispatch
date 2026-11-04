@@ -1,0 +1,15 @@
+{
+  "name": "@hexdispatch/matching",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "PURE matching library. No I/O, no clock, no randomness. Shared by production dispatch and the simulator.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ."
+  }
+}
