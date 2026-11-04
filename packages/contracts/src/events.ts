@@ -55,6 +55,37 @@ export const surgeUpdatedPayload = z.object({
   ts: z.string().datetime(),
 });
 
+export const offerSentPayload = z.object({
+  offerId: z.string().uuid(),
+  rideId: z.string().uuid(),
+  driverId: z.string().uuid(),
+  expiresAt: z.string().datetime(),
+  pickup: latLngSchema,
+  dropoff: latLngSchema,
+  pickupEtaSec: z.number().nonnegative(),
+});
+
+export const offerDeclinedPayload = z.object({
+  offerId: z.string().uuid(),
+  rideId: z.string().uuid(),
+  driverId: z.string().uuid(),
+  reason: z.string().optional(),
+});
+
+export const offerExpiredPayload = z.object({
+  offerId: z.string().uuid(),
+  rideId: z.string().uuid(),
+  driverId: z.string().uuid(),
+});
+
+export const rideMatchedPayload = z.object({
+  rideId: z.string().uuid(),
+  driverId: z.string().uuid(),
+  policy: z.string().min(1),
+  cost: z.number().nonnegative(),
+  batchId: z.string().uuid().nullable().optional(),
+});
+
 export const rideRequestedEvent = eventEnvelope(TOPICS.RIDE_REQUESTED, rideRequestedPayload);
 export const tripStateChangedEvent = eventEnvelope(
   TOPICS.TRIP_STATE_CHANGED,
@@ -62,8 +93,16 @@ export const tripStateChangedEvent = eventEnvelope(
 );
 export const locationUpdatedEvent = eventEnvelope(TOPICS.LOCATION_UPDATED, locationUpdatedPayload);
 export const surgeUpdatedEvent = eventEnvelope(TOPICS.PRICING_SURGE_UPDATED, surgeUpdatedPayload);
+export const offerSentEvent = eventEnvelope(TOPICS.OFFER_SENT, offerSentPayload);
+export const offerDeclinedEvent = eventEnvelope(TOPICS.OFFER_DECLINED, offerDeclinedPayload);
+export const offerExpiredEvent = eventEnvelope(TOPICS.OFFER_EXPIRED, offerExpiredPayload);
+export const rideMatchedEvent = eventEnvelope(TOPICS.RIDE_MATCHED, rideMatchedPayload);
 
 export type RideRequestedEvent = z.infer<typeof rideRequestedEvent>;
 export type TripStateChangedEvent = z.infer<typeof tripStateChangedEvent>;
 export type LocationUpdatedEvent = z.infer<typeof locationUpdatedEvent>;
 export type SurgeUpdatedEvent = z.infer<typeof surgeUpdatedEvent>;
+export type OfferSentEvent = z.infer<typeof offerSentEvent>;
+export type OfferDeclinedEvent = z.infer<typeof offerDeclinedEvent>;
+export type OfferExpiredEvent = z.infer<typeof offerExpiredEvent>;
+export type RideMatchedEvent = z.infer<typeof rideMatchedEvent>;

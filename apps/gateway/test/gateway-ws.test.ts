@@ -217,10 +217,10 @@ describe('Gateway Realtime & Multi-Node Fanout (AC3)', () => {
     client2.close();
 
     expect(replayedEvents).toHaveLength(2);
-    expect(replayedEvents[0].type).toBe('STEP_2');
-    expect(replayedEvents[0].data.step).toBe(2);
-    expect(replayedEvents[1].type).toBe('STEP_3');
-    expect(replayedEvents[1].data.step).toBe(3);
+    expect(replayedEvents[0]!.type).toBe('STEP_2');
+    expect(replayedEvents[0]!.data.step).toBe(2);
+    expect(replayedEvents[1]!.type).toBe('STEP_3');
+    expect(replayedEvents[1]!.data.step).toBe(3);
     // Crucially: event 1 was NOT replayed (no duplicate)
     expect(replayedEvents.find((e) => e.type === 'STEP_1')).toBeUndefined();
   });

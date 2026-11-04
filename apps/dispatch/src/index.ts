@@ -1,6 +1,100 @@
-import { buildServer, loadServiceEnv, startServer } from '@hexdispatch/shared';
+import Redis from 'ioredis';
+import { Kafka } from 'kafkajs';
+import { loadServiceEnv, startServer, KafkaProducer, KafkaConsumer } from '@hexdispatch/shared';
+import { TOPICS, type RideRequestedEvent } from '@hexdispatch/contracts';
+import { getDispatchDb } from './db/index';
+import { DriverClaimService } from './services/driver-claim';
+import { MatchingRegistry } from './services/matching-registry';
+import { OfferManager } from './services/offer-manager';
+import { DispatchEngine } from './services/dispatch-engine';
+import { buildDispatchApp } from './app';
 
 const env = loadServiceEnv('DISPATCH_PORT', 3003);
-const app = buildServer({ service: 'dispatch', logLevel: env.LOG_LEVEL });
+const { db, close: closeDb } = getDispatchDb();
+
+const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
+const redis = new Redis(redisUrl, { lazyConnect: true });
+
+try {
+  await redis.connect();
+} catch (err) {
+  console.warn('Could not connect to Redis at startup; running in degraded mode', err);
+}
+
+const kafkaBrokers = (process.env.KAFKA_BROKERS ?? 'localhost:19092').split(',');
+const kafka = new Kafka({
+  clientId: 'dispatch-service',
+  brokers: kafkaBrokers,
+});
+const producer = new KafkaProducer(kafka, undefined);
+
+const claimService = new DriverClaimService(redis);
+const matchingRegistry = new MatchingRegistry();
+
+// eslint-disable-next-line prefer-const -- Initialized below after offerManager
+let dispatchEngine: DispatchEngine;
+
+const offerManager = new OfferManager({
+  db,
+  redis,
+  claimService,
+  producer,
+  coreApiUrl: process.env.CORE_API_URL ?? 'http://localhost:3001',
+  gatewayBroadcastUrl: process.env.GATEWAY_URL ?? 'http://localhost:3000',
+  redisPubSub: redis,
+  defaultOfferTimeoutSec: Number(process.env.OFFER_TIMEOUT_SEC ?? 15),
+  onReofferNeeded: async (rideId, excludedDriverId) => {
+    if (dispatchEngine) {
+      await dispatchEngine.handleReofferNeeded(rideId, excludedDriverId);
+    }
+  },
+});
+
+dispatchEngine = new DispatchEngine({
+  db,
+  offerManager,
+  matchingRegistry,
+  claimService,
+  coreApiUrl: process.env.CORE_API_URL ?? 'http://localhost:3001',
+  locationUrl: process.env.LOCATION_URL ?? 'http://localhost:3002',
+  gatewayBroadcastUrl: process.env.GATEWAY_URL ?? 'http://localhost:3000',
+  redisPubSub: redis,
+  matchingPolicy: process.env.MATCHING_POLICY ?? 'greedy',
+  maxOfferAttempts: Number(process.env.MAX_OFFER_ATTEMPTS ?? 3),
+});
+
+// Task 8: Startup Recovery of Pending Offers
+try {
+  const recovery = await offerManager.recoverPendingOffers();
+  console.log(
+    `Dispatch startup recovery: ${recovery.recoveredCount} offers re-armed, ${recovery.expiredCount} expired`,
+  );
+} catch (err) {
+  console.warn('Failed to recover pending offers at startup:', err);
+}
+
+// Kafka Consumer for ride.requested (Task 1)
+const consumer = new KafkaConsumer(kafka, 'dispatch-group', producer);
+try {
+  await consumer.subscribe<RideRequestedEvent>([TOPICS.RIDE_REQUESTED], async (event) => {
+    await dispatchEngine.handleRideRequested(event);
+  });
+} catch (err) {
+  console.warn('Could not connect Kafka consumer at startup; continuing...', err);
+}
+
+const app = await buildDispatchApp({
+  offerManager,
+  dispatchEngine,
+  logLevel: env.LOG_LEVEL,
+});
+
+app.addHook('onClose', async () => {
+  offerManager.stop();
+  await consumer.disconnect().catch(() => {});
+  await producer.disconnect().catch(() => {});
+  if (redis.status === 'ready') await redis.quit().catch(() => {});
+  await closeDb();
+});
 
 await startServer(app, { host: env.HOST, port: env.PORT });

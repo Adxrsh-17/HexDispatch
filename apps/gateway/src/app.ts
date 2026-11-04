@@ -17,6 +17,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export interface GatewayOptions {
   coreApiUrl?: string;
+  dispatchUrl?: string;
+  locationUrl?: string;
   redisClient?: Redis;
   redisSubClient?: Redis;
   realtimeGateway?: RealtimeGateway;
@@ -28,6 +30,8 @@ export interface GatewayOptions {
 export async function buildGatewayApp(options: GatewayOptions = {}): Promise<FastifyInstance> {
   const {
     coreApiUrl = process.env.CORE_API_URL ?? 'http://localhost:3001',
+    dispatchUrl = process.env.DISPATCH_URL ?? 'http://localhost:3003',
+    locationUrl = process.env.LOCATION_URL ?? 'http://localhost:3002',
     redisClient,
     redisSubClient,
     realtimeGateway: injectedGateway,
@@ -87,13 +91,14 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
     }
   }
 
-  // Forwarding helper to core-api
-  async function forwardToCoreApi(
+  // Forwarding helper to arbitrary internal service
+  async function forwardToService(
+    serviceUrl: string,
     request: FastifyRequest,
     reply: FastifyReply,
     user?: AuthTokenPayload,
   ) {
-    const targetUrl = new URL(request.url, coreApiUrl).toString();
+    const targetUrl = new URL(request.url, serviceUrl).toString();
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       'x-request-id': request.id,
@@ -129,6 +134,26 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
     }
     const text = await response.text();
     return reply.send(text);
+  }
+
+  function forwardToCoreApi(request: FastifyRequest, reply: FastifyReply, user?: AuthTokenPayload) {
+    return forwardToService(coreApiUrl, request, reply, user);
+  }
+
+  function forwardToDispatch(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    user?: AuthTokenPayload,
+  ) {
+    return forwardToService(dispatchUrl, request, reply, user);
+  }
+
+  function forwardToLocation(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    user?: AuthTokenPayload,
+  ) {
+    return forwardToService(locationUrl, request, reply, user);
   }
 
   // --- Realtime WebSocket Gateway ---
@@ -216,6 +241,15 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
   });
 
   // --- Driver Routes ---
+  app.post('/drivers/me/location', async (request, reply) => {
+    const user = await authenticate(request);
+    if (user.role !== 'DRIVER') {
+      throw AppError.forbidden('Forbidden: DRIVER role required');
+    }
+    await applyRateLimit(`user:${user.userId}`, reply);
+    return forwardToLocation(request, reply, user);
+  });
+
   app.patch('/drivers/me/status', async (request, reply) => {
     const user = await authenticate(request);
     if (user.role !== 'DRIVER') {
@@ -232,6 +266,59 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
     }
     await applyRateLimit(`user:${user.userId}`, reply);
     return forwardToCoreApi(request, reply, user);
+  });
+
+  // --- Offer Routes (forwarded to dispatch) ---
+  app.get('/offers/:id', async (request, reply) => {
+    const user = await authenticate(request);
+    await applyRateLimit(`user:${user.userId}`, reply);
+    return forwardToDispatch(request, reply, user);
+  });
+
+  app.post('/offers/:id/accept', async (request, reply) => {
+    const user = await authenticate(request);
+    if (user.role !== 'DRIVER') {
+      throw AppError.forbidden('Forbidden: DRIVER role required');
+    }
+    await applyRateLimit(`user:${user.userId}`, reply);
+    return forwardToDispatch(request, reply, user);
+  });
+
+  app.post('/offers/:id/decline', async (request, reply) => {
+    const user = await authenticate(request);
+    if (user.role !== 'DRIVER') {
+      throw AppError.forbidden('Forbidden: DRIVER role required');
+    }
+    await applyRateLimit(`user:${user.userId}`, reply);
+    return forwardToDispatch(request, reply, user);
+  });
+
+  // --- Ride Progress Routes (forwarded to dispatch) ---
+  app.post('/rides/:id/arrived', async (request, reply) => {
+    const user = await authenticate(request);
+    if (user.role !== 'DRIVER') {
+      throw AppError.forbidden('Forbidden: DRIVER role required');
+    }
+    await applyRateLimit(`user:${user.userId}`, reply);
+    return forwardToDispatch(request, reply, user);
+  });
+
+  app.post('/rides/:id/start', async (request, reply) => {
+    const user = await authenticate(request);
+    if (user.role !== 'DRIVER') {
+      throw AppError.forbidden('Forbidden: DRIVER role required');
+    }
+    await applyRateLimit(`user:${user.userId}`, reply);
+    return forwardToDispatch(request, reply, user);
+  });
+
+  app.post('/rides/:id/complete', async (request, reply) => {
+    const user = await authenticate(request);
+    if (user.role !== 'DRIVER') {
+      throw AppError.forbidden('Forbidden: DRIVER role required');
+    }
+    await applyRateLimit(`user:${user.userId}`, reply);
+    return forwardToDispatch(request, reply, user);
   });
 
   // --- Ride Routes ---

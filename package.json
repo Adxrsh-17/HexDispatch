@@ -25,6 +25,7 @@
     "@testcontainers/postgresql": "^12.2.1",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.23.1",
+    "@types/ws": "^8.5.14",
     "drizzle-kit": "^0.31.11",
     "eslint": "^9.17.0",
     "eslint-config-prettier": "^10.0.1",
@@ -37,6 +38,7 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.19.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.0.0",
+    "ws": "^8.22.1"
   }
 }
