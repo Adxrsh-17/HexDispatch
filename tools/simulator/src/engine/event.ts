@@ -37,6 +37,10 @@ export interface RideRequestedPayload {
   dropoff: LatLng;
 }
 
+export interface MatchCyclePayload {
+  windowSec: number;
+}
+
 export interface RetryMatchPayload {
   rideId: string;
 }

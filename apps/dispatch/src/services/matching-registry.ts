@@ -1,10 +1,11 @@
-import { GreedyPolicy, type MatchingPolicy } from '@hexdispatch/matching';
+import { BatchedPolicy, GreedyPolicy, type MatchingPolicy } from '@hexdispatch/matching';
 
 export class MatchingRegistry {
   private policies = new Map<string, MatchingPolicy>();
 
   constructor() {
     this.register(new GreedyPolicy());
+    this.register(new BatchedPolicy());
   }
 
   register(policy: MatchingPolicy): void {

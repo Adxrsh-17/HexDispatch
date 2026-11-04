@@ -1,9 +1,17 @@
 import { eq } from 'drizzle-orm';
-import type { RideRequestedEvent } from '@hexdispatch/contracts';
+import { randomUUID } from 'node:crypto';
+import { latLngToCell } from 'h3-js';
+import { Counter, Histogram, type Registry } from 'prom-client';
+import {
+  TOPICS,
+  type RideRequestedEvent,
+  type DispatchBatchCompletedEvent,
+} from '@hexdispatch/contracts';
 import {
   type DriverCandidate,
   type RideRequest,
   type MatchContext,
+  GreedyPolicy,
   DEFAULT_MATCHING_CONFIG,
 } from '@hexdispatch/matching';
 import { processedEvents } from '../db/schema';
@@ -24,6 +32,13 @@ export interface DispatchEngineOptions {
   redisPubSub?: Redis;
   matchingPolicy?: string;
   maxOfferAttempts?: number;
+  batchWindowMs?: number;
+  batchLagFallbackMs?: number;
+  h3MatcherOwnerRes?: number;
+  metricsRegistry?: Registry;
+  producer?: {
+    publish: (topic: string, key: string, payload: unknown) => Promise<void>;
+  };
 }
 
 export interface ActiveRideState {
@@ -39,12 +54,71 @@ export interface ActiveRideState {
 
 export class DispatchEngine {
   private activeRides = new Map<string, ActiveRideState>();
+  private regionPendingRides = new Map<string, Set<string>>();
   private policyName: string;
   private maxAttempts: number;
+  private batchWindowMs: number;
+  private batchLagFallbackMs: number;
+  private h3MatcherOwnerRes: number;
+  private batchTimer?: NodeJS.Timeout;
+  private lastBatchRunMs = Date.now();
+  private forceFallback = false;
+
+  readonly fallbackCounter: Counter<string>;
+  readonly batchDurationHistogram: Histogram<string>;
 
   constructor(private options: DispatchEngineOptions) {
     this.policyName = options.matchingPolicy ?? 'greedy';
     this.maxAttempts = options.maxOfferAttempts ?? 3;
+    this.batchWindowMs = options.batchWindowMs ?? 2000;
+    this.batchLagFallbackMs = options.batchLagFallbackMs ?? 5000;
+    this.h3MatcherOwnerRes = options.h3MatcherOwnerRes ?? 6;
+
+    const registry = options.metricsRegistry;
+    this.fallbackCounter = new Counter({
+      name: 'dispatch_fallback_total',
+      help: 'Total number of batch matching fallbacks to greedy',
+      registers: registry ? [registry] : [],
+    });
+    this.batchDurationHistogram = new Histogram({
+      name: 'dispatch_batch_duration_seconds',
+      help: 'Duration of batch matching cycles in seconds',
+      buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
+      registers: registry ? [registry] : [],
+    });
+
+    if (this.policyName === 'batched' && this.batchWindowMs > 0) {
+      this.startBatchTimer();
+    }
+  }
+
+  startBatchTimer(): void {
+    if (this.batchTimer) return;
+    this.batchTimer = setInterval(() => {
+      this.runBatchCycle().catch((err) => {
+        console.error('Error during scheduled batch matching cycle:', err);
+      });
+    }, this.batchWindowMs);
+  }
+
+  stopBatchTimer(): void {
+    if (this.batchTimer) {
+      clearInterval(this.batchTimer);
+      this.batchTimer = undefined;
+    }
+  }
+
+  stop(): void {
+    this.stopBatchTimer();
+    this.regionPendingRides.clear();
+  }
+
+  setForceFallback(force: boolean): void {
+    this.forceFallback = force;
+  }
+
+  getRegionForPoint(point: { lat: number; lng: number }): string {
+    return latLngToCell(point.lat, point.lng, this.h3MatcherOwnerRes);
   }
 
   getPolicyName(): string {
@@ -53,6 +127,11 @@ export class DispatchEngine {
 
   setPolicyName(name: string): void {
     this.policyName = name;
+    if (name === 'batched' && this.batchWindowMs > 0) {
+      this.startBatchTimer();
+    } else {
+      this.stopBatchTimer();
+    }
   }
 
   getActiveRide(rideId: string): ActiveRideState | undefined {
@@ -114,7 +193,18 @@ export class DispatchEngine {
     }
 
     // 4. Trigger dispatching
-    await this.dispatchRide(payload.rideId);
+    if (this.policyName === 'greedy') {
+      await this.dispatchRide(payload.rideId);
+    } else {
+      // In batched mode: add to region pending queue
+      const region = this.getRegionForPoint(payload.pickup);
+      let set = this.regionPendingRides.get(region);
+      if (!set) {
+        set = new Set<string>();
+        this.regionPendingRides.set(region, set);
+      }
+      set.add(payload.rideId);
+    }
   }
 
   async dispatchRide(rideId: string): Promise<boolean> {
@@ -218,12 +308,174 @@ export class DispatchEngine {
     return true;
   }
 
+  async runBatchCycle(targetRegion?: string): Promise<{
+    batchId: string;
+    assignmentsCount: number;
+    unmatchedCount: number;
+    fallback: boolean;
+  }> {
+    const batchId = randomUUID();
+    const startMs = Date.now();
+    const lagMs = startMs - this.lastBatchRunMs;
+    this.lastBatchRunMs = startMs;
+
+    const regionsToProcess = targetRegion
+      ? [targetRegion]
+      : Array.from(this.regionPendingRides.keys());
+
+    let totalAssignments = 0;
+    let totalUnmatched = 0;
+    let usedFallback = false;
+
+    // Check lag fallback
+    const isLagFallback = lagMs > this.batchLagFallbackMs;
+    const shouldFallback = this.forceFallback || isLagFallback;
+
+    if (shouldFallback) {
+      usedFallback = true;
+      this.fallbackCounter.inc();
+    }
+
+    for (const region of regionsToProcess) {
+      const pendingSet = this.regionPendingRides.get(region);
+      if (!pendingSet || pendingSet.size === 0) continue;
+
+      const rideIds = Array.from(pendingSet);
+      const eligibleRides: ActiveRideState[] = [];
+
+      for (const rideId of rideIds) {
+        const ride = this.activeRides.get(rideId);
+        if (!ride) {
+          pendingSet.delete(rideId);
+          continue;
+        }
+        if (ride.attempts >= this.maxAttempts) {
+          await this.handleNoDriverFound(rideId);
+          pendingSet.delete(rideId);
+          totalUnmatched += 1;
+        } else {
+          eligibleRides.push(ride);
+        }
+      }
+
+      if (eligibleRides.length === 0) continue;
+
+      // Choose policy (if fallback, use GreedyPolicy; else BatchedPolicy)
+      const policy = shouldFallback
+        ? new GreedyPolicy()
+        : this.options.matchingRegistry.get(this.policyName);
+
+      // Collect drivers near pickups of eligible rides
+      const driversMap = new Map<string, DriverCandidate>();
+      for (const ride of eligibleRides) {
+        const nearby = await this.fetchNearbyDrivers(ride.pickup);
+        for (const d of nearby) {
+          if (!driversMap.has(d.id)) {
+            const claim = await this.options.claimService.getClaim(d.id);
+            if (!claim) {
+              driversMap.set(d.id, d);
+            }
+          }
+        }
+      }
+
+      const availableCandidates = Array.from(driversMap.values());
+      const requests: RideRequest[] = eligibleRides.map((r) => ({
+        id: r.rideId,
+        pickup: r.pickup,
+        requestedAtMs: r.requestedAtMs,
+        excludedDriverIds: Array.from(r.excludedDriverIds),
+      }));
+
+      const ctx: MatchContext = {
+        nowMs: Date.now(),
+        config: DEFAULT_MATCHING_CONFIG,
+      };
+
+      const result = policy.match(requests, availableCandidates, ctx);
+
+      // Process assignments
+      for (const assignment of result.assignments) {
+        const ride = this.activeRides.get(assignment.rideId);
+        if (!ride) continue;
+
+        ride.attempts += 1;
+        const offer = await this.options.offerManager.createOffer({
+          rideId: ride.rideId,
+          driverId: assignment.driverId,
+          pickup: ride.pickup,
+          dropoff: ride.dropoff,
+          pickupEtaSec: assignment.pickupEtaSec,
+          cost: assignment.cost,
+          policy: policy.name,
+          batchId,
+        });
+
+        if (offer) {
+          pendingSet.delete(ride.rideId);
+          totalAssignments += 1;
+        } else {
+          // Concurrent claim collision: exclude driver and leave ride in pendingSet
+          ride.excludedDriverIds.add(assignment.driverId);
+        }
+      }
+
+      totalUnmatched += result.unmatchedRideIds.length;
+
+      // Publish dispatch.batch.completed
+      const durationMs = Date.now() - startMs;
+      const batchEvent: DispatchBatchCompletedEvent = {
+        eventId: randomUUID(),
+        type: TOPICS.DISPATCH_BATCH_COMPLETED,
+        version: 1,
+        occurredAt: new Date().toISOString(),
+        correlationId: batchId,
+        payload: {
+          batchId,
+          region,
+          policy: policy.name,
+          fallback: shouldFallback,
+          assignmentsCount: result.assignments.length,
+          unmatchedCount: result.unmatchedRideIds.length,
+          durationMs,
+        },
+      };
+
+      if (this.options.producer) {
+        await this.options.producer.publish(TOPICS.DISPATCH_BATCH_COMPLETED, region, batchEvent);
+      }
+      await this.notifyRealtime(`region:${region}`, 'DISPATCH_BATCH_COMPLETED', batchEvent.payload);
+    }
+
+    const durationSec = (Date.now() - startMs) / 1000;
+    this.batchDurationHistogram.observe(durationSec);
+
+    return {
+      batchId,
+      assignmentsCount: totalAssignments,
+      unmatchedCount: totalUnmatched,
+      fallback: usedFallback,
+    };
+  }
+
   async handleReofferNeeded(rideId: string, excludedDriverId: string): Promise<void> {
     const ride = this.activeRides.get(rideId);
     if (ride) {
       ride.excludedDriverIds.add(excludedDriverId);
     }
-    await this.dispatchRide(rideId);
+    if (this.policyName === 'batched') {
+      if (ride) {
+        const region = this.getRegionForPoint(ride.pickup);
+        let set = this.regionPendingRides.get(region);
+        if (!set) {
+          set = new Set<string>();
+          this.regionPendingRides.set(region, set);
+        }
+        set.add(rideId);
+      }
+    } else {
+      await this.dispatchRide(rideId);
+    }
   }
 
   private async handleNoDriverFound(rideId: string): Promise<void> {

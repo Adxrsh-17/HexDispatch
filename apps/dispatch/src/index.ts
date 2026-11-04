@@ -61,6 +61,10 @@ dispatchEngine = new DispatchEngine({
   redisPubSub: redis,
   matchingPolicy: process.env.MATCHING_POLICY ?? 'greedy',
   maxOfferAttempts: Number(process.env.MAX_OFFER_ATTEMPTS ?? 3),
+  batchWindowMs: Number(process.env.BATCH_WINDOW_MS ?? 2000),
+  batchLagFallbackMs: Number(process.env.BATCH_LAG_FALLBACK_MS ?? 5000),
+  h3MatcherOwnerRes: Number(process.env.H3_MATCHER_OWNER_RES ?? 6),
+  producer,
 });
 
 // Task 8: Startup Recovery of Pending Offers
@@ -90,6 +94,7 @@ const app = await buildDispatchApp({
 });
 
 app.addHook('onClose', async () => {
+  dispatchEngine.stop();
   offerManager.stop();
   await consumer.disconnect().catch(() => {});
   await producer.disconnect().catch(() => {});

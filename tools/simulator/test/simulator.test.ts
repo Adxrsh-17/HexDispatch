@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GreedyPolicy } from '@hexdispatch/matching';
+import { BatchedPolicy, GreedyPolicy } from '@hexdispatch/matching';
 import { CitySimulator } from '../src/simulator';
 import type { ScenarioConfig } from '../src/scenarios/types';
 import { generateCsvReport, type ReportMetadata } from '../src/metrics/report';
@@ -108,5 +108,20 @@ describe('City Simulator Acceptance Criteria (Phase 4)', () => {
     const rainRes = rainSim.run();
     expect(rainRes.metrics.completedRides).toBeGreaterThan(0);
     expect(rainRes.metrics.pickupEtaAvgSec).toBeGreaterThan(0);
+  });
+
+  it('runs BatchedPolicy deterministically and yields byte-identical output across duplicate runs', () => {
+    const normal = loadScenario('normal');
+    normal.durationSec = 1800; // 30 min test
+    const seed = 42;
+
+    const sim1 = new CitySimulator(normal, seed, new BatchedPolicy(), 2);
+    const res1 = sim1.run();
+
+    const sim2 = new CitySimulator(normal, seed, new BatchedPolicy(), 2);
+    const res2 = sim2.run();
+
+    expect(res1.metrics).toEqual(res2.metrics);
+    expect(res1.metrics.completedRides).toBeGreaterThan(0);
   });
 });

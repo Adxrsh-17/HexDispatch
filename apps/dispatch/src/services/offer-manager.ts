@@ -20,6 +20,7 @@ export interface CreateOfferParams {
   pickupEtaSec: number;
   cost: number;
   policy?: string;
+  batchId?: string | null;
   timeoutSec?: number;
 }
 
@@ -84,6 +85,8 @@ export class OfferManager {
         status: 'PENDING',
         pickupEtaSec: Math.round(params.pickupEtaSec),
         cost: params.cost,
+        policy: params.policy ?? 'greedy',
+        batchId: params.batchId ?? null,
         expiresAt,
         createdAt: now,
         updatedAt: now,
@@ -169,14 +172,16 @@ export class OfferManager {
     // 3. Clean up Redis offer key
     await this.options.redis.del(this.offerKey(offer.rideId, offer.driverId));
 
-    // 4. Record in match_decisions (policy = 'greedy')
+    // 4. Record in match_decisions
+    const decisionPolicy = updated.policy ?? 'greedy';
+    const decisionBatchId = updated.batchId ?? null;
     await this.options.db.insert(matchDecisions).values({
       id: randomUUID(),
       rideId: offer.rideId,
       driverId: offer.driverId,
-      policy: 'greedy',
+      policy: decisionPolicy,
       cost: offer.cost,
-      batchId: null,
+      batchId: decisionBatchId,
       createdAt: now,
     });
 
@@ -207,9 +212,9 @@ export class OfferManager {
       payload: {
         rideId: offer.rideId,
         driverId: offer.driverId,
-        policy: 'greedy',
+        policy: decisionPolicy,
         cost: offer.cost,
-        batchId: null,
+        batchId: decisionBatchId,
       },
     };
 

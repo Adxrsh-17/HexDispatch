@@ -119,5 +119,12 @@ export async function buildDispatchApp(options: DispatchAppOptions): Promise<Fas
     return reply.send({ status: 'processing', rideId: event.payload.rideId });
   });
 
+  // POST /internal/batch/cycle (Trigger batch cycle on-demand)
+  app.post('/internal/batch/cycle', async (request, reply) => {
+    const query = request.query as { region?: string };
+    const res = await dispatchEngine.runBatchCycle(query?.region);
+    return reply.send(res);
+  });
+
   return app;
 }

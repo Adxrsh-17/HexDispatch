@@ -76,4 +76,28 @@ describe.skipIf(!dockerAvailable)('Dispatch Testcontainers Integration (PostgreS
     const allOffers = await dbConnection.db.select().from(offers);
     expect(allOffers).toEqual([]);
   });
+
+  it('executes batched dispatch cycle against real PostgreSQL 16', async () => {
+    const claimService = new DriverClaimService(redis);
+    const matchingRegistry = new MatchingRegistry();
+    const offerManager = new OfferManager({
+      db: dbConnection.db,
+      redis,
+      claimService,
+    });
+
+    const dispatchEngine = new DispatchEngine({
+      db: dbConnection.db,
+      offerManager,
+      matchingRegistry,
+      claimService,
+      matchingPolicy: 'batched',
+      batchWindowMs: 0,
+    });
+
+    const result = await dispatchEngine.runBatchCycle();
+    expect(result.fallback).toBe(false);
+    expect(result.assignmentsCount).toBe(0);
+    dispatchEngine.stop();
+  });
 });

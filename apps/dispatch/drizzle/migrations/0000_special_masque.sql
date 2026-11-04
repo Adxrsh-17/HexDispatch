@@ -15,6 +15,8 @@ CREATE TABLE "offers" (
 	"status" varchar(32) DEFAULT 'PENDING' NOT NULL,
 	"pickup_eta_sec" integer NOT NULL,
 	"cost" double precision NOT NULL,
+	"policy" varchar(64) DEFAULT 'greedy' NOT NULL,
+	"batch_id" uuid,
 	"expires_at" timestamp with time zone NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL

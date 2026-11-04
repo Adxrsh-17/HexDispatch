@@ -24,11 +24,26 @@ export interface MatchingConfig {
   speedMps: number;
   /** A pair with a longer pickup ETA is infeasible. */
   maxPickupEtaSec: number;
+  /** Weight applied to driver idle seconds when computing idle bonus. Default: 0.1. */
+  idleWeight?: number;
+  /** Maximum idle bonus in seconds. Default: 120. */
+  maxIdleBonusSec?: number;
+  /** Weight applied to rider wait time seconds when computing wait penalty. Default: 0.2. */
+  waitWeight?: number;
+  /** Base penalty for leaving a rider unmatched in seconds. Default: 600. */
+  unmatchedBaseCostSec?: number;
+  /** Maximum batch problem size (requests * drivers) before fallback to greedy. Default: 10000. */
+  batchMaxCells?: number;
 }
 
 export const DEFAULT_MATCHING_CONFIG: MatchingConfig = {
   speedMps: 8.33,
   maxPickupEtaSec: 600,
+  idleWeight: 0.1,
+  maxIdleBonusSec: 120,
+  waitWeight: 0.2,
+  unmatchedBaseCostSec: 600,
+  batchMaxCells: 10000,
 };
 
 export interface MatchContext {

@@ -7,6 +7,8 @@ export const offers = pgTable('offers', {
   status: varchar('status', { length: 32 }).notNull().default('PENDING'),
   pickupEtaSec: integer('pickup_eta_sec').notNull(),
   cost: doublePrecision('cost').notNull(),
+  policy: varchar('policy', { length: 64 }).notNull().default('greedy'),
+  batchId: uuid('batch_id'),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),

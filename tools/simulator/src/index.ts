@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { GreedyPolicy, type MatchingPolicy } from '@hexdispatch/matching';
+import { BatchedPolicy, GreedyPolicy, type MatchingPolicy } from '@hexdispatch/matching';
 import { CitySimulator } from './simulator';
 import type { ScenarioConfig } from './scenarios/types';
 import {
@@ -28,6 +28,7 @@ interface ParsedArgs {
   policy: string;
   seed: number;
   duration?: number;
+  window: number;
   outDir: string;
   writeFiles: boolean;
 }
@@ -38,6 +39,7 @@ function parseCliArgs(argv: string[]): ParsedArgs {
   let policy = 'greedy';
   let seed = 42;
   let duration: number | undefined;
+  let window = 2;
   let outDir = path.resolve(__dirname, '../../../docs/benchmarks');
   let writeFiles = true;
 
@@ -51,6 +53,8 @@ function parseCliArgs(argv: string[]): ParsedArgs {
       seed = Number.parseInt(args[++i]!, 10);
     } else if (arg === '--duration' && args[i + 1]) {
       duration = Number.parseInt(args[++i]!, 10);
+    } else if (arg === '--window' && args[i + 1]) {
+      window = Number.parseFloat(args[++i]!);
     } else if (arg === '--out' && args[i + 1]) {
       outDir = path.resolve(process.cwd(), args[++i]!);
     } else if (arg === '--no-write') {
@@ -58,7 +62,7 @@ function parseCliArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  return { scenario, policy, seed, duration, outDir, writeFiles };
+  return { scenario, policy, seed, duration, window, outDir, writeFiles };
 }
 
 function loadScenario(name: string): ScenarioConfig {
@@ -73,10 +77,14 @@ function loadScenario(name: string): ScenarioConfig {
 }
 
 function resolvePolicy(name: string): MatchingPolicy {
-  if (name.toLowerCase() === 'greedy') {
+  const lower = name.toLowerCase();
+  if (lower === 'greedy') {
     return new GreedyPolicy();
   }
-  throw new Error(`Unsupported policy '${name}'. In Phase 4, only 'greedy' is supported.`);
+  if (lower === 'batched') {
+    return new BatchedPolicy();
+  }
+  throw new Error(`Unsupported policy '${name}'. Supported policies: 'greedy', 'batched'.`);
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
@@ -88,7 +96,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   const policy = resolvePolicy(parsed.policy);
   const gitCommit = getGitCommit();
-  const command = `pnpm sim --scenario ${parsed.scenario} --policy ${parsed.policy} --seed ${parsed.seed}`;
+  const command = `pnpm sim --scenario ${parsed.scenario} --policy ${parsed.policy} --seed ${parsed.seed}${parsed.window !== 2 ? ` --window ${parsed.window}` : ''}`;
   const timestamp = new Date().toISOString();
 
   console.log('====================================================');
@@ -96,7 +104,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   console.log(`Policy: ${policy.name} | Seed: ${parsed.seed} | Duration: ${scenario.durationSec}s`);
   console.log('====================================================');
 
-  const sim = new CitySimulator(scenario, parsed.seed, policy);
+  const sim = new CitySimulator(scenario, parsed.seed, policy, parsed.window);
   const startMs = Date.now();
   const result = sim.run();
   const elapsedMs = Date.now() - startMs;

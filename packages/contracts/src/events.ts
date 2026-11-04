@@ -55,6 +55,16 @@ export const surgeUpdatedPayload = z.object({
   ts: z.string().datetime(),
 });
 
+export const dispatchBatchCompletedPayload = z.object({
+  batchId: z.string().uuid(),
+  region: z.string(),
+  policy: z.string(),
+  fallback: z.boolean(),
+  assignmentsCount: z.number().int().nonnegative(),
+  unmatchedCount: z.number().int().nonnegative(),
+  durationMs: z.number().nonnegative(),
+});
+
 export const offerSentPayload = z.object({
   offerId: z.string().uuid(),
   rideId: z.string().uuid(),
@@ -91,6 +101,10 @@ export const tripStateChangedEvent = eventEnvelope(
   TOPICS.TRIP_STATE_CHANGED,
   tripStateChangedPayload,
 );
+export const dispatchBatchCompletedEvent = eventEnvelope(
+  TOPICS.DISPATCH_BATCH_COMPLETED,
+  dispatchBatchCompletedPayload,
+);
 export const locationUpdatedEvent = eventEnvelope(TOPICS.LOCATION_UPDATED, locationUpdatedPayload);
 export const surgeUpdatedEvent = eventEnvelope(TOPICS.PRICING_SURGE_UPDATED, surgeUpdatedPayload);
 export const offerSentEvent = eventEnvelope(TOPICS.OFFER_SENT, offerSentPayload);
@@ -100,6 +114,7 @@ export const rideMatchedEvent = eventEnvelope(TOPICS.RIDE_MATCHED, rideMatchedPa
 
 export type RideRequestedEvent = z.infer<typeof rideRequestedEvent>;
 export type TripStateChangedEvent = z.infer<typeof tripStateChangedEvent>;
+export type DispatchBatchCompletedEvent = z.infer<typeof dispatchBatchCompletedEvent>;
 export type LocationUpdatedEvent = z.infer<typeof locationUpdatedEvent>;
 export type SurgeUpdatedEvent = z.infer<typeof surgeUpdatedEvent>;
 export type OfferSentEvent = z.infer<typeof offerSentEvent>;
