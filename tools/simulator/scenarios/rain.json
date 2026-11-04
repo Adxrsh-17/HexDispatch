@@ -1,0 +1,35 @@
+{
+  "name": "rain",
+  "description": "Sudden torrential monsoon downpour shock causing demand surge and 35% road speed degradation",
+  "durationSec": 7200,
+  "city": {
+    "center": { "lat": 12.9716, "lng": 77.5946 },
+    "radiusKm": 10,
+    "baseSpeedMps": 8.33,
+    "speedMultiplier": 0.65
+  },
+  "demand": {
+    "baseArrivalRatePerHour": 350,
+    "bursts": [
+      {
+        "id": "monsoon_downpour",
+        "name": "Sudden Monsoon Storm",
+        "startSec": 2400,
+        "durationSec": 3600,
+        "multiplier": 2.2
+      }
+    ]
+  },
+  "drivers": {
+    "count": 100,
+    "baseAcceptanceRate": 0.84,
+    "minShiftDurationSec": 7200,
+    "maxShiftDurationSec": 7200
+  },
+  "matching": {
+    "policy": "greedy",
+    "batchWindowSec": 0,
+    "maxOfferAttempts": 3,
+    "offerTimeoutSec": 15
+  }
+}

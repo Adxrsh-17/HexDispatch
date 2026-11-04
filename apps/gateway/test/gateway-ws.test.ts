@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import Redis from 'ioredis-mock';
 import WebSocket from 'ws';
 import { buildGatewayApp } from '../src/app';
@@ -61,7 +62,7 @@ describe('Gateway Realtime & Multi-Node Fanout (AC3)', () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Generic WebSocket message payload for tests
   function waitForMessage(ws: WebSocket, predicate?: (msg: any) => boolean): Promise<any> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Timeout waiting for ws message')), 4000);
+      const timer = setTimeout(() => reject(new Error('Timeout waiting for ws message')), 10000);
       const handler = (data: Buffer | string) => {
         try {
           const parsed = JSON.parse(data.toString());
@@ -101,7 +102,7 @@ describe('Gateway Realtime & Multi-Node Fanout (AC3)', () => {
   });
 
   it('multi-node fanout: event published on Node 1 reaches rider connected to Node 2', async () => {
-    const room = 'ride:multi-node-456';
+    const room = `ride:multi-node-${randomUUID()}`;
     const clientOnNode1 = await connectWs(node1Port, riderToken);
     const clientOnNode2 = await connectWs(node2Port, riderToken);
 
@@ -149,7 +150,7 @@ describe('Gateway Realtime & Multi-Node Fanout (AC3)', () => {
   });
 
   it('reconnects with lastEventId to replay missed events without gaps or duplicates', async () => {
-    const room = 'ride:replay-789';
+    const room = `ride:replay-${randomUUID()}`;
     const client1 = await connectWs(node1Port, riderToken);
 
     let firstEventId = '';

@@ -289,6 +289,9 @@ importers:
       '@hexdispatch/matching':
         specifier: workspace:*
         version: link:../../packages/matching
+      h3-js:
+        specifier: ^4.5.0
+        version: 4.5.0
 
 packages:
 

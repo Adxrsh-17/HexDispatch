@@ -57,7 +57,7 @@ In Claude Code, run `/phase N` (for example `/phase 0`). One phase at a time; th
 - [x] Phase 1: Core API
 - [x] Phase 2: Location and realtime
 - [x] Phase 3: Baseline dispatch
-- [ ] Phase 4: City simulator
+- [x] Phase 4: City simulator
 - [ ] Phase 5: Batched matching
 - [ ] Phase 6: Pricing and surge
 - [ ] Phase 7: Payments
@@ -66,4 +66,6 @@ In Claude Code, run `/phase N` (for example `/phase 0`). One phase at a time; th
 
 ## Benchmarks
 
-None yet. Results will appear in `docs/benchmarks/` with the command and seed that produced them.
+Benchmark results from `@hexdispatch/simulator` are located in [`docs/benchmarks/`](docs/benchmarks/README.md).
+
+- Baseline greedy benchmarks: `normal`, `peak`, and `rain` scenarios.

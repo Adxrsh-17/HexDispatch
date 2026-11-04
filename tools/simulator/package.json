@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
-    "@hexdispatch/matching": "workspace:*"
+    "@hexdispatch/matching": "workspace:*",
+    "h3-js": "^4.5.0"
   }
 }

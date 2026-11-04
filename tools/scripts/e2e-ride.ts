@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
 import Redis from 'ioredis-mock';
-import type RedisClient from 'ioredis';
+type RedisClient = InstanceType<typeof Redis>;
 import { buildCoreApiApp } from '../../apps/core-api/src/app';
 import { buildLocationApp } from '../../apps/location/src/app';
 import { DriverIndex } from '../../apps/location/src/driver-index';
@@ -165,18 +165,16 @@ function connectWs(gatewayUrl: string, token: string): Promise<WebSocket> {
   });
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Generic event matcher
 function waitForEvent(
   ws: WebSocket,
-  predicate: (msg: any) => boolean,
+  predicate: (msg: Record<string, unknown>) => boolean,
   timeoutMs = 5000,
-): Promise<any> {
+): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Timeout waiting for event')), timeoutMs);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- WS message handler
-    const handler = (data: any) => {
+    const handler = (data: WebSocket.RawData) => {
       try {
-        const parsed = JSON.parse(data.toString());
+        const parsed = JSON.parse(data.toString()) as Record<string, unknown>;
         if (predicate(parsed)) {
           clearTimeout(timer);
           ws.off('message', handler);
