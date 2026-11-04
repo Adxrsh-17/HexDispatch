@@ -215,9 +215,43 @@ importers:
 
   apps/payment:
     dependencies:
+      '@hexdispatch/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@hexdispatch/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      drizzle-orm:
+        specifier: ^0.45.4
+        version: 0.45.4(@electric-sql/pglite@0.5.15)(@opentelemetry/api@1.10.0)(@types/pg@8.23.1)(pg@8.23.1)(postgres@4.0.0)
+      fastify:
+        specifier: ^5.2.0
+        version: 5.12.8
+      fastify-type-provider-zod:
+        specifier: ^4.0.2
+        version: 4.0.2(fastify@5.12.8)(zod@3.25.76)
+      ioredis:
+        specifier: ^6.0.0
+        version: 6.0.0
+      kafkajs:
+        specifier: ^2.2.4
+        version: 2.2.4
+      prom-client:
+        specifier: ^15.1.3
+        version: 15.1.3
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
+    devDependencies:
+      '@types/pg':
+        specifier: ^8.11.11
+        version: 8.23.1
+      drizzle-kit:
+        specifier: ^0.31.9
+        version: 0.31.11
+      pg:
+        specifier: ^8.13.3
+        version: 8.23.1
 
   apps/pricing:
     dependencies:
