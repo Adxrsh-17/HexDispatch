@@ -54,7 +54,7 @@ In Claude Code, run `/phase N` (for example `/phase 0`). One phase at a time; th
 
 - [x] Scaffold (workspace, `buildServer`, GreedyPolicy, docs, infra files)
 - [ ] Phase 0: Foundations
-- [ ] Phase 1: Core API
+- [x] Phase 1: Core API
 - [ ] Phase 2: Location and realtime
 - [ ] Phase 3: Baseline dispatch
 - [ ] Phase 4: City simulator
