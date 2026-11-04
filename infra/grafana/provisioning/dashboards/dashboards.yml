@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: 'HexDispatch Production Monitoring'
+    orgId: 1
+    folder: 'HexDispatch'
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 10
+    options:
+      path: /etc/grafana/provisioning/dashboards/json

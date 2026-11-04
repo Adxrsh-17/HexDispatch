@@ -1,0 +1,42 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "HexDispatch Unified API Gateway",
+    "description": "Public edge proxy, JWT authentication & role-based access control, sliding-window rate limiting, and bidirectional WebSockets",
+    "version": "1.0.0"
+  },
+  "servers": [{ "url": "http://localhost:3000", "description": "Local Gateway Proxy" }],
+  "paths": {
+    "/auth/signup": {
+      "post": {
+        "summary": "User registration (proxied to core-api)",
+        "tags": ["Auth"]
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "summary": "User login & JWT issuance (proxied to core-api)",
+        "tags": ["Auth"]
+      }
+    },
+    "/rides": {
+      "post": {
+        "summary": "Request a ride (proxied to core-api)",
+        "tags": ["Rides"]
+      }
+    },
+    "/drivers/me/location": {
+      "post": {
+        "summary": "Driver GPS ping (proxied to location)",
+        "tags": ["Location"]
+      }
+    },
+    "/ws": {
+      "get": {
+        "summary": "Bidirectional WebSocket connection",
+        "description": "Real-time trip notifications, driver dispatch offers, and location tracking over WebSocket. Authenticated via token query param or Bearer header.",
+        "tags": ["Realtime WebSocket"]
+      }
+    }
+  }
+}

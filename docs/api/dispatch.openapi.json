@@ -1,0 +1,85 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "HexDispatch Dispatch & Matching Service",
+    "description": "Batched H3-sharded Hungarian assignment, greedy fallback, atomic driver claims, and offer lifecycle",
+    "version": "1.0.0"
+  },
+  "servers": [
+    { "url": "http://localhost:3000/dispatch", "description": "API Gateway" },
+    { "url": "http://localhost:3003", "description": "Direct Dispatch Service" }
+  ],
+  "paths": {
+    "/offers/{offerId}/respond": {
+      "post": {
+        "summary": "Respond to a dispatched ride offer",
+        "description": "Driver accepts or declines an active offer. Acceptance triggers ride assignment; decline cleans claim and cascades re-offer.",
+        "tags": ["Offers"],
+        "parameters": [
+          {
+            "name": "offerId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["driverId", "action"],
+                "properties": {
+                  "driverId": { "type": "string", "format": "uuid" },
+                  "action": { "type": "string", "enum": ["ACCEPT", "DECLINE"] }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Response recorded successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string" },
+                    "rideId": { "type": "string" },
+                    "action": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "description": "Offer not found or already expired" },
+          "409": { "description": "Driver already assigned or claim expired" }
+        }
+      }
+    },
+    "/matching/trigger": {
+      "post": {
+        "summary": "Trigger immediate matching cycle (Admin / Test)",
+        "description": "Forces evaluation of pending requests in active H3 matcher regions.",
+        "tags": ["Matching"],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "matchedCount": { "type": "integer" },
+                    "batchId": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

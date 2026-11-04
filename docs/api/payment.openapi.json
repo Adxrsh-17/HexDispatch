@@ -1,0 +1,85 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "HexDispatch Payment & Ledger Service",
+    "description": "Event-driven idempotent payments saga, double-entry financial ledger, mock PSP with network chaos simulation, and automated reconciliation",
+    "version": "1.0.0"
+  },
+  "servers": [
+    { "url": "http://localhost:3000/payment", "description": "API Gateway" },
+    { "url": "http://localhost:3005", "description": "Direct Payment Service" }
+  ],
+  "paths": {
+    "/rides/{id}/payment": {
+      "get": {
+        "summary": "Get payment and saga status for a ride",
+        "tags": ["Payments"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "payment": { "type": "object" },
+                    "saga": { "type": "object" },
+                    "ledgerEntries": { "type": "array", "items": { "type": "object" } }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "description": "Payment not found for ride" }
+        }
+      }
+    },
+    "/admin/reconcile": {
+      "post": {
+        "summary": "Run financial reconciliation between Ledger and PSP",
+        "description": "Scans all completed transactions, identifies missing ledger entries, missing PSP records, amount mismatches, and duplicate charges.",
+        "tags": ["Admin & Audit"],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string" },
+                    "mismatches": { "type": "array", "items": { "type": "object" } },
+                    "auditedAt": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/payouts/batch": {
+      "post": {
+        "summary": "Execute batch driver payouts",
+        "description": "Aggregates outstanding driver_payable balances, executes PSP transfer, and posts balancing ledger entries.",
+        "tags": ["Payouts"],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "payoutsProcessed": { "type": "integer" },
+                    "totalAmountMinorUnits": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

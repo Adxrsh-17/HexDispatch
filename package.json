@@ -18,7 +18,14 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "sim": "pnpm --filter @hexdispatch/simulator start",
-    "chaos": "tsx tools/chaos/runner.ts"
+    "chaos": "tsx tools/chaos/runner.ts",
+    "bench:load": "tsx tools/load-tests/run-all-load-tests.ts",
+    "demo": "tsx tools/scripts/demo.ts"
+  },
+  "pnpm": {
+    "overrides": {
+      "tinypool": ">=2.1.2"
+    }
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.15",
@@ -27,6 +34,7 @@
     "@types/node": "^22.10.0",
     "@types/pg": "^8.23.1",
     "@types/ws": "^8.5.14",
+    "drizzle-orm": "^0.45.4",
     "drizzle-kit": "^0.31.11",
     "eslint": "^9.17.0",
     "eslint-config-prettier": "^10.0.1",

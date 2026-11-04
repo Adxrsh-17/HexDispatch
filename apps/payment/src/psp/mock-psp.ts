@@ -71,6 +71,10 @@ export class MockPspClient {
     this.rng = new DeterministicRng(config.seed ?? 42);
   }
 
+  updateConfig(config: Partial<MockPspConfig>): void {
+    this.config = { ...this.config, ...config };
+  }
+
   reset(): void {
     this.idempotencyStore.clear();
     this.transactions.clear();

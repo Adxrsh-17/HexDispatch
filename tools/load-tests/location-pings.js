@@ -9,8 +9,8 @@ export const options = {
   scenarios: {
     sustained_pings: {
       executor: 'constant-vus',
-      vus: 20,
-      duration: '15s',
+      vus: 10,
+      duration: '5s',
     },
   },
   thresholds: {

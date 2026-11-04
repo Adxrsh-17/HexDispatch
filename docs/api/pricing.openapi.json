@@ -1,0 +1,94 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "HexDispatch Pricing & Surge Service",
+    "description": "Deterministic locked fare quotes, closed-loop EWMA surge multiplier control loop, and H3 res 8 neighbour blending",
+    "version": "1.0.0"
+  },
+  "servers": [
+    { "url": "http://localhost:3000/pricing", "description": "API Gateway" },
+    { "url": "http://localhost:3004", "description": "Direct Pricing Service" }
+  ],
+  "paths": {
+    "/quotes": {
+      "post": {
+        "summary": "Request locked fare quote",
+        "description": "Calculates upfront price estimate with distance, time, and real-time surge multiplier. Locked with 15-minute TTL.",
+        "tags": ["Quotes"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["pickup", "dropoff"],
+                "properties": {
+                  "pickup": {
+                    "type": "object",
+                    "required": ["lat", "lng"],
+                    "properties": { "lat": { "type": "number" }, "lng": { "type": "number" } }
+                  },
+                  "dropoff": {
+                    "type": "object",
+                    "required": ["lat", "lng"],
+                    "properties": { "lat": { "type": "number" }, "lng": { "type": "number" } }
+                  },
+                  "vehicleType": { "type": "string", "default": "standard" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Locked quote generated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "quoteId": { "type": "string", "format": "uuid" },
+                    "pickupCell": { "type": "string" },
+                    "baseFareCents": { "type": "integer" },
+                    "distanceKm": { "type": "number" },
+                    "durationMin": { "type": "number" },
+                    "surgeMultiplier": { "type": "number" },
+                    "totalFareCents": { "type": "integer" },
+                    "expiresAt": { "type": "string", "format": "date-time" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/surge/{cell}": {
+      "get": {
+        "summary": "Get current surge state for an H3 cell",
+        "tags": ["Surge"],
+        "parameters": [
+          { "name": "cell", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "cell": { "type": "string" },
+                    "multiplier": { "type": "number" },
+                    "smoothedDemand": { "type": "number" },
+                    "smoothedSupply": { "type": "number" },
+                    "updatedAt": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

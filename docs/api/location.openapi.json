@@ -1,0 +1,133 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "HexDispatch Location Ingestion Service",
+    "description": "High-throughput driver telemetry ingest, H3 spatial indexing, nearby search, trust anomaly evaluation, and backpressure queueing",
+    "version": "1.0.0"
+  },
+  "servers": [
+    { "url": "http://localhost:3000/location", "description": "API Gateway" },
+    { "url": "http://localhost:3002", "description": "Direct Location Service" }
+  ],
+  "paths": {
+    "/drivers/me/location": {
+      "post": {
+        "summary": "Submit live driver GPS ping",
+        "description": "Receives high-frequency GPS ping, validates freshness, tests trust anomaly rules, updates H3 spatial index in Redis, and enqueues to Kafka batch publisher.",
+        "tags": ["Location"],
+        "parameters": [
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["lat", "lng"],
+                "properties": {
+                  "lat": { "type": "number", "minimum": -90, "maximum": 90 },
+                  "lng": { "type": "number", "minimum": -180, "maximum": 180 },
+                  "heading": { "type": "number", "minimum": 0, "maximum": 360 },
+                  "speedMps": { "type": "number", "minimum": 0 },
+                  "status": {
+                    "type": "string",
+                    "enum": ["AVAILABLE", "ON_OFFER", "ON_TRIP", "OFFLINE"],
+                    "default": "AVAILABLE"
+                  },
+                  "ts": { "type": "string", "format": "date-time" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ping accepted and spatial index updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "ok" },
+                    "cell": { "type": "string", "example": "88618925d3fffff" },
+                    "previousCell": { "type": "string", "nullable": true },
+                    "ts": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Stale ping, future timestamp skew, or impossible speed" },
+          "429": { "description": "Ingest overloaded (backpressure load shed)" }
+        }
+      }
+    },
+    "/drivers/nearby": {
+      "get": {
+        "summary": "Search nearby available drivers (Internal / Dispatch)",
+        "description": "Uses H3 k-ring traversal to query available drivers within radius km.",
+        "tags": ["Location"],
+        "parameters": [
+          { "name": "lat", "in": "query", "required": true, "schema": { "type": "number" } },
+          { "name": "lng", "in": "query", "required": true, "schema": { "type": "number" } },
+          { "name": "radiusKm", "in": "query", "schema": { "type": "number", "default": 5 } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10 } },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": { "type": "string", "default": "AVAILABLE" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Candidate drivers found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "driverId": { "type": "string" },
+                      "lat": { "type": "number" },
+                      "lng": { "type": "number" },
+                      "distanceKm": { "type": "number" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/trust/flags": {
+      "get": {
+        "summary": "List flagged trust anomalies",
+        "description": "Returns all flagged impossible speeds, teleport jumps, frozen GPS, and cancellation abuse records.",
+        "tags": ["Trust & Resilience"],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer" },
+                    "flags": { "type": "array", "items": { "type": "object" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

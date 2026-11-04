@@ -50,6 +50,11 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
 
   app.addHook('onSend', async (request, reply) => {
     reply.header('x-request-id', request.id);
+    reply.header('x-content-type-options', 'nosniff');
+    reply.header('x-frame-options', 'DENY');
+    reply.header('x-xss-protection', '0');
+    reply.header('strict-transport-security', 'max-age=31536000; includeSubDomains');
+    reply.header('referrer-policy', 'no-referrer');
   });
   app.addHook('onResponse', async (request, reply) => {
     httpDuration

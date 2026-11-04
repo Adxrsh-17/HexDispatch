@@ -1,0 +1,97 @@
+{
+  "root_group": {
+    "name": "",
+    "path": "",
+    "id": "d41d8cd98f00b204e9800998ecf8427e",
+    "groups": {},
+    "checks": {
+      "status is 101": {
+        "name": "status is 101",
+        "path": "::status is 101",
+        "id": "b26b36ccbc717178372f638aae5b6111",
+        "passes": 4288,
+        "fails": 0
+      }
+    }
+  },
+  "metrics": {
+    "ws_sessions": {
+      "count": 4288,
+      "rate": 855.3047895971162
+    },
+    "ws_msgs_sent": {
+      "count": 4288,
+      "rate": 855.3047895971162
+    },
+    "vus_max": {
+      "value": 10,
+      "min": 10,
+      "max": 10
+    },
+    "ws_connect_duration_ms": {
+      "p(90)": 12,
+      "p(95)": 13,
+      "avg": 10.94472947761194,
+      "min": 2,
+      "med": 11,
+      "max": 32,
+      "thresholds": {
+        "p(95)<250": false
+      }
+    },
+    "ws_connecting": {
+      "min": 2.7038,
+      "med": 10.79185,
+      "max": 29.9565,
+      "p(90)": 12.15919,
+      "p(95)": 12.898005,
+      "avg": 10.831791651119442
+    },
+    "iteration_duration": {
+      "max": 32.6585,
+      "p(90)": 13.02,
+      "p(95)": 13.730674999999994,
+      "avg": 11.659294986007481,
+      "min": 3.8001,
+      "med": 11.58995
+    },
+    "iterations": {
+      "count": 4288,
+      "rate": 855.3047895971162
+    },
+    "ws_messages_received_k6": {
+      "count": 4288,
+      "rate": 855.3047895971162
+    },
+    "data_received": {
+      "count": 797568,
+      "rate": 159086.6908650636
+    },
+    "vus": {
+      "value": 10,
+      "min": 10,
+      "max": 10
+    },
+    "ws_session_duration": {
+      "med": 11.487950000000001,
+      "max": 31.1923,
+      "p(90)": 12.92271,
+      "p(95)": 13.640844999999999,
+      "avg": 11.558410657649253,
+      "min": 3.8001
+    },
+    "checks": {
+      "passes": 4288,
+      "fails": 0,
+      "value": 1
+    },
+    "data_sent": {
+      "count": 1209216,
+      "rate": 241195.95066638675
+    },
+    "ws_msgs_received": {
+      "count": 4288,
+      "rate": 855.3047895971162
+    }
+  }
+}
