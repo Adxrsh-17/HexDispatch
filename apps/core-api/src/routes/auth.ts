@@ -15,7 +15,8 @@ import { users, drivers, type User } from '../db/schema';
 const signupSchema = z.object({
   email: z.string().email(),
   password: z.string().min(6),
-  role: z.enum(['RIDER', 'DRIVER', 'ADMIN']).default('RIDER'),
+  // ADMIN accounts are never self-service; provision them out of band (seed/DB).
+  role: z.enum(['RIDER', 'DRIVER']).default('RIDER'),
   vehicleType: z.string().min(1).optional(),
   plate: z.string().min(1).optional(),
 });

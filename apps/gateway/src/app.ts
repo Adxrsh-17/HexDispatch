@@ -9,6 +9,9 @@ import {
   AppError,
   verifyToken,
   RateLimiter,
+  assertInternalRequest,
+  assertJwtSecretConfigured,
+  internalFetch,
   type AuthTokenPayload,
 } from '@hexdispatch/shared';
 import { RealtimeGateway } from './ws/gateway-ws';
@@ -25,6 +28,11 @@ export interface GatewayOptions {
   logLevel?: string;
   rateLimitMax?: number;
   rateLimitWindowSec?: number;
+  /**
+   * Accept the literal WebSocket tokens `demo` and `test` (demo page, local experiments).
+   * Never honoured when NODE_ENV=production. Default: ALLOW_DEMO_WS_TOKEN=true.
+   */
+  allowDemoWsToken?: boolean;
 }
 
 export async function buildGatewayApp(options: GatewayOptions = {}): Promise<FastifyInstance> {
@@ -38,7 +46,12 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
     logLevel,
     rateLimitMax = Number(process.env.RATE_LIMIT_MAX ?? 100),
     rateLimitWindowSec = Number(process.env.RATE_LIMIT_WINDOW_SEC ?? 60),
+    allowDemoWsToken = process.env.ALLOW_DEMO_WS_TOKEN === 'true',
   } = options;
+
+  // Fail at boot (not on first login) if production is missing its secrets.
+  assertJwtSecretConfigured();
+  const demoTokensEnabled = allowDemoWsToken && process.env.NODE_ENV !== 'production';
 
   const rateLimiter = new RateLimiter(redisClient);
 
@@ -54,7 +67,9 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
     logLevel,
     readinessChecks: {
       coreApi: async () => {
-        const res = await fetch(`${coreApiUrl}/health`, { signal: AbortSignal.timeout(2000) });
+        const res = await internalFetch(`${coreApiUrl}/health`, {
+          signal: AbortSignal.timeout(2000),
+        });
         if (!res.ok) throw new Error(`Core API health check failed with status ${res.status}`);
       },
     },
@@ -99,6 +114,7 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
     user?: AuthTokenPayload,
   ) {
     const targetUrl = new URL(request.url, serviceUrl).toString();
+    // Never forward caller-supplied identity: x-user-* are set below from the verified JWT only.
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       'x-request-id': request.id,
@@ -124,7 +140,7 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
       fetchOptions.body = JSON.stringify(request.body);
     }
 
-    const response = await fetch(targetUrl, fetchOptions);
+    const response = await internalFetch(targetUrl, fetchOptions);
     const contentType = response.headers.get('content-type') ?? '';
 
     reply.code(response.status);
@@ -161,8 +177,20 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
     const url = new URL(req.url, 'http://localhost');
     const token = url.searchParams.get('token') ?? (req.headers.authorization?.slice(7) || '');
 
+    // Attach the message listener synchronously. Authentication is async; a client may send its
+    // first frame right after the upgrade, and anything arriving before a listener exists is lost.
+    type Frame = Buffer | string;
+    const early: Frame[] = [];
+    let handleFrame: (data: Frame) => void = (data) => {
+      early.push(data);
+    };
+    socket.on('message', (data: Frame) => handleFrame(data));
+    socket.on('close', () => {
+      realtimeGateway.handleDisconnect(socket);
+    });
+
     let user: AuthTokenPayload;
-    if (token === 'demo' || (process.env.NODE_ENV !== 'production' && token === 'test')) {
+    if (demoTokensEnabled && (token === 'demo' || token === 'test')) {
       user = { userId: 'demo-user', role: 'RIDER', email: 'demo@example.com' };
     } else {
       try {
@@ -174,37 +202,38 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
       }
     }
 
-    socket.on('message', async (data: Buffer | string) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'ping') {
-          socket.send(JSON.stringify({ type: 'pong', ts: new Date().toISOString() }));
-          return;
-        }
+    handleFrame = (data: Frame) => {
+      void (async () => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === 'ping') {
+            socket.send(JSON.stringify({ type: 'pong', ts: new Date().toISOString() }));
+            return;
+          }
 
-        if (msg.type === 'subscribe' && msg.room) {
-          await realtimeGateway.subscribe(socket, user, msg.room, msg.lastEventId);
-          socket.send(JSON.stringify({ ack: true, subscribed: msg.room }));
-          return;
-        }
+          if (msg.type === 'subscribe' && msg.room) {
+            await realtimeGateway.subscribe(socket, user, msg.room, msg.lastEventId);
+            socket.send(JSON.stringify({ ack: true, subscribed: msg.room }));
+            return;
+          }
 
-        if (msg.type === 'unsubscribe' && msg.room) {
-          realtimeGateway.unsubscribe(socket, msg.room);
-          socket.send(JSON.stringify({ ack: true, unsubscribed: msg.room }));
-          return;
+          if (msg.type === 'unsubscribe' && msg.room) {
+            realtimeGateway.unsubscribe(socket, msg.room);
+            socket.send(JSON.stringify({ ack: true, unsubscribed: msg.room }));
+            return;
+          }
+        } catch {
+          socket.send(JSON.stringify({ error: 'Malformed message' }));
         }
-      } catch {
-        socket.send(JSON.stringify({ error: 'Malformed message' }));
-      }
-    });
-
-    socket.on('close', () => {
-      realtimeGateway.handleDisconnect(socket);
-    });
+      })();
+    };
+    for (const frame of early.splice(0)) handleFrame(frame);
   });
 
   // --- Broadcast Event Route (Internal/Gateway pubsub trigger) ---
+  // Internal only: other services call this to push events to WebSocket rooms.
   app.post('/events/broadcast', async (request, reply) => {
+    assertInternalRequest(request);
     const body = request.body as { room: string; type: string; data: unknown };
     if (!body || !body.room || !body.type) {
       throw AppError.badRequest('Missing room or type in broadcast payload');
@@ -352,11 +381,9 @@ export async function buildGatewayApp(options: GatewayOptions = {}): Promise<Fas
     return forwardToCoreApi(request, reply, user);
   });
 
-  app.post('/rides/:id/transition', async (request, reply) => {
-    const user = await authenticate(request);
-    await applyRateLimit(`user:${user.userId}`, reply);
-    return forwardToCoreApi(request, reply, user);
-  });
+  // NOTE: there is deliberately no public /rides/:id/transition route. State changes happen only
+  // through the role-checked routes above (cancel, offers, arrived/start/complete) or from
+  // internal services holding the internal token.
 
   return app;
 }

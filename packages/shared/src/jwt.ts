@@ -14,8 +14,15 @@ const ACCESS_TOKEN_EXPIRY = '15m';
 const REFRESH_TOKEN_EXPIRY = '7d';
 
 function getSecretKey(secret?: string): Uint8Array {
-  const secretStr = secret ?? process.env.JWT_SECRET ?? DEFAULT_SECRET;
-  return new TextEncoder().encode(secretStr);
+  const configured = secret ?? process.env.JWT_SECRET;
+  if (!configured && process.env.NODE_ENV === 'production') {
+    // Never fall back to the public dev secret in production: anyone could mint admin tokens.
+    throw new Error('JWT_SECRET is required when NODE_ENV=production');
+  }
+  if (configured && process.env.NODE_ENV === 'production' && configured.length < 32) {
+    throw new Error('JWT_SECRET must be at least 32 characters in production');
+  }
+  return new TextEncoder().encode(configured ?? DEFAULT_SECRET);
 }
 
 export async function signAccessToken(payload: AuthTokenPayload, secret?: string): Promise<string> {
@@ -58,4 +65,9 @@ export async function verifyToken(token: string, secret?: string): Promise<AuthT
     if (err instanceof AppError) throw err;
     throw AppError.unauthorized('Invalid or expired token');
   }
+}
+
+/** Call at boot so a misconfigured production deploy fails immediately, not on first login. */
+export function assertJwtSecretConfigured(): void {
+  getSecretKey();
 }

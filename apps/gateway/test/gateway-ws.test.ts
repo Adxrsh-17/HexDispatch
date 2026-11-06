@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { withInternalAuth } from '@hexdispatch/shared';
 import { randomUUID } from 'node:crypto';
 import Redis from 'ioredis-mock';
 import WebSocket from 'ws';
@@ -29,19 +30,25 @@ describe('Gateway Realtime & Multi-Node Fanout (AC3)', () => {
     sharedRedisPub2 = new Redis();
     sharedRedisSub2 = new Redis();
 
-    node1App = await buildGatewayApp({
-      redisClient: sharedRedisPub1,
-      redisSubClient: sharedRedisSub1,
-      logLevel: 'silent',
-    });
+    node1App = withInternalAuth(
+      await buildGatewayApp({
+        redisClient: sharedRedisPub1,
+        redisSubClient: sharedRedisSub1,
+        logLevel: 'silent',
+        allowDemoWsToken: true,
+      }),
+    );
     const addr1 = await node1App.listen({ host: '127.0.0.1', port: 0 });
     node1Port = Number(new URL(addr1).port);
 
-    node2App = await buildGatewayApp({
-      redisClient: sharedRedisPub2,
-      redisSubClient: sharedRedisSub2,
-      logLevel: 'silent',
-    });
+    node2App = withInternalAuth(
+      await buildGatewayApp({
+        redisClient: sharedRedisPub2,
+        redisSubClient: sharedRedisSub2,
+        logLevel: 'silent',
+        allowDemoWsToken: true,
+      }),
+    );
     const addr2 = await node2App.listen({ host: '127.0.0.1', port: 0 });
     node2Port = Number(new URL(addr2).port);
   });

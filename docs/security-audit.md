@@ -9,10 +9,10 @@ This document outlines the defensive security architecture, audit findings, and 
 HexDispatch enforces **defense-in-depth** across all architectural layers:
 
 - **API Boundary**: Strict runtime schema enforcement via Zod (`@hexdispatch/contracts`), parameterized SQL via Drizzle ORM, and automated security header injection.
-- **Authentication & RBAC**: Asymmetric JWT verification with role-based access control (`rider`, `driver`, `admin`).
+- **Authentication & RBAC**: HS256 JWT verification (shared secret; required in production, with a boot-time check) with role-based access control (`rider`, `driver`, `admin`).
 - **Telemetry & Fraud Prevention**: Dedicated Trust Rules Engine detecting GPS teleportation, impossible speed anomalies, frozen mock GPS coordinates, and cancellation rate abuse.
 - **Financial Integrity**: Double-entry ledger invariant assertions, PSP idempotency key guarantees, and deterministic saga recovery.
-- **Dependency Hygiene**: Zero critical unmitigated vulnerabilities; automated dependency audit scanning via `pnpm audit`.
+- **Dependency Hygiene**: `pnpm audit --prod` currently reports 1 high and 2 moderate findings (minimatch advisory); none are mitigated yet.
 
 ---
 
@@ -52,9 +52,19 @@ Referrer-Policy: no-referrer
 X-Request-Id: <uuid>
 ```
 
+### 3.2b Service authentication and authorization (added after review)
+
+- **Only the gateway is public.** Every other service (core-api, dispatch, location, pricing, payment) rejects any request without a valid `x-internal-token` (constant-time comparison), except `/health`, `/ready`, `/metrics`. `x-user-id` / `x-user-role` are trusted only because of that check; the gateway builds them from the verified JWT and never forwards caller-supplied copies. Production refuses to boot without `INTERNAL_SERVICE_TOKEN` (>= 16 chars) and `JWT_SECRET` (>= 32 chars).
+- **No public state-machine route.** The gateway no longer exposes `/rides/:id/transition`. core-api accepts `body.actor` only from an internal service call (no end-user identity); for an end user the actor is derived from their verified role.
+- **Ownership checks.** Riders read and cancel only their own rides; drivers read only offers addressed to them; listings are scoped to the caller. Drivers can only arrive/start/complete rides whose accepted offer is theirs.
+- **`/events/broadcast`** requires the internal token. WebSocket tokens `demo` / `test` are off unless `ALLOW_DEMO_WS_TOKEN=true`, and never honoured when `NODE_ENV=production`.
+- **No self-service ADMIN signup.** Admin accounts must be provisioned out of band.
+- Tests: `apps/core-api/test/authorization.test.ts`, `apps/gateway/test/gateway-hardening.test.ts`, `packages/shared/test/internal-auth.test.ts`.
+- Still open: refresh tokens are not distinguished from access tokens on `/auth/refresh`; no token revocation; pricing/payment admin routes rely solely on the internal token (no per-admin identity).
+
 ### 3.3 Environment Secrets & Isolation
 
-- Production credentials (`JWT_SECRET`, `DATABASE_URL`, `REDIS_URL`, `KAFKA_BROKERS`, `PSP_WEBHOOK_SECRET`) are isolated via `.env` files and environment variables.
+- Production credentials (`JWT_SECRET`, `DATABASE_URL`, `REDIS_URL`, `KAFKA_BROKERS`) are isolated via `.env` files and environment variables.
 - Default secrets are provided strictly for local development and unit test execution; production deployments require secrets injected via environment managers or secret vaults.
 - `.env` and `.env.local` files are ignored in `.gitignore`.
 
