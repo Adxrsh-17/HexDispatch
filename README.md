@@ -8,7 +8,7 @@ Unlike conventional CRUD ride-hailing tutorials that greedily assign the single 
 - **Dynamic Surge as a Negative-Feedback Control Loop:** Continuous exponential smoothing (EWMA), neighbor spatial blending, rate-limiting clamps, and hysteresis prevent price oscillation while rebalancing localized supply-demand deficits.
 - **Idempotent Double-Entry Payment Saga:** Trips emit terminal state transitions over Kafka, triggering distributed sagas with deterministic idempotency keys, PSP timeout auto-recovery, and double-entry general ledger invariant verification ($\sum \text{debits} \equiv \sum \text{credits}$).
 - **Realtime Trust & Anomaly Detection:** Realtime telemetry engine flags impossible driver velocities ($> 42\text{ m/s}$), teleport jumps ($> 500\text{ m}$), frozen GPS fraud during active trips, and driver cancellation abuse.
-- **Resilience & Chaos Engineering:** Graceful degradation with dynamic circuit breakers, bounded ingestion queues with load shedding, and automatic fallback from batched Hungarian matching to greedy dispatch when batch lags spike.
+- **Resilience:** Circuit breakers, bounded ingestion queues with load shedding, and fallback from batched Hungarian matching to greedy dispatch when a window runs late, the solver throws, or a solve exceeds its time budget (covered by `apps/dispatch/test/hardening.test.ts`). The Docker-based failure-injection runner (`pnpm chaos`) reports **NOT RUN** without Docker and only measures container recovery time; see [`docs/resilience.md`](docs/resilience.md).
 - **Seeded Discrete-Event City Simulator:** Runs production matching logic against synthetic demand distributions (Normal, Peak, Rain) to empirically validate dispatch efficiency, driver utilization, and fairness.
 
 ---
@@ -24,15 +24,15 @@ flowchart TD
     end
 
     subgraph KafkaCluster["Event Backbone (Apache Kafka / Redpanda)"]
-        T_Loc["driver.location.updated"]
+        T_Loc["location.updated"]
         T_Ride["ride.requested / ride.matched"]
         T_Trip["trip.state.changed"]
-        T_Pay["payment.authorized / settled"]
+        T_Pay["payment.authorized / captured"]
     end
 
     subgraph CoreServices["Microservices Platform"]
         CoreAPI["<b>Core API (:3001)</b><br/>Users, Drivers, Rides, Trips<br/>Transactional Outbox Relay"]
-        LocSvc["<b>Location Service (:3002)</b><br/>H3 Spatial Index, Redis Geospatial<br/>Trust Rules Engine & Load Shedding"]
+        LocSvc["<b>Location Service (:3002)</b><br/>H3 Spatial Index, H3 cell sets in Redis<br/>Trust Rules Engine & Load Shedding"]
         PricingSvc["<b>Pricing Service (:3004)</b><br/>EWMA H3 Surge Control Loop<br/>Dynamic Multipliers & Hysteresis"]
         DispatchSvc["<b>Dispatch Service (:3003)</b><br/>Batched Hungarian Matcher (H3 Res 6/7)<br/>Atomic Redis Claims & Greedy Fallback"]
         PaymentSvc["<b>Payment Service (:3005)</b><br/>Idempotent Payment Saga<br/>Double-Entry General Ledger"]
@@ -40,7 +40,7 @@ flowchart TD
 
     subgraph Persistence["State & Storage"]
         PG[("PostgreSQL 16<br/>Drizzle ORM")]
-        RedisDB[("Redis 7<br/>Atomic Lua Claims, Pub/Sub, Geo")]
+        RedisDB[("Redis 7<br/>Atomic Lua Claims, Pub/Sub, H3 cell sets")]
     end
 
     subgraph Observability["Telemetry & Monitoring"]
@@ -141,49 +141,17 @@ pnpm infra:down
 
 ---
 
-## Showcase Demo (`pnpm demo`)
+## Demo (`pnpm demo`)
 
-The one-command showcase (`tools/scripts/demo.ts`) executes an end-to-end integration lifecycle demonstrating all core architectural guarantees without external dependencies:
+`tools/scripts/demo.ts` runs core-api, location, dispatch, the gateway and the payment saga in one process and **asserts** each step; it exits non-zero if any check fails. It prints only what it verified:
 
-```
-========================================================================
-      HEXDISPATCH PRODUCTION SHOWCASE & ARCHITECTURE DEMO
-========================================================================
+1. A rider and a driver go through request -> offer -> accept -> arrive -> start -> complete via the gateway, then the demo reads core-api's database and checks the ride is `COMPLETED` with the full seven-step `ride_events` chain.
+2. The real `trip.state.changed` events from core-api's outbox are fed to the payment saga while the mock PSP times out on every call. The demo checks the saga finishes, there is exactly one capture at the PSP, a duplicate delivery changes nothing, and the double-entry ledger balances.
+3. The batched solver is made to throw; the demo checks the window falls back to greedy and the rider still gets an offer.
 
->>> [BOOT] Initializing in-process microservices environment...
-[BOOT] All 5 microservices running cleanly: Core, Location, Dispatch, Gateway, Payment
+Substitutions (so it needs no Docker): PGlite for Postgres, an in-memory Redis, direct calls instead of the Kafka hop, the in-memory mock PSP. It is not a test of the real infrastructure.
 
->>> [SEED] Registering accounts in Core API...
-[SEED] Driver KA-01-HEX-99 placed at Bangalore Center (12.9716, 77.5946). Status: AVAILABLE
-
-STAGE 1: Batched H3-Sharded Matching Flow
-  1. Rider requests ride: MG Road -> Indiranagar ($12.50)...
-  2. Batched Matching collects window & computes minimum-cost Hungarian assignment...
-     MATCH FOUND! Offer dispatched to closest driver (Expires in 15 seconds)
-  3. Driver accepts offer via Gateway...
-     Offer accepted! Driver claim locked atomically in Redis.
-
-STAGE 2: Trip State Transitions & Live Telemetry
-  1. Driver arrives at pickup (ARRIVED)
-  2. Passenger boards vehicle, driver starts trip (IN_TRIP)
-  3. Vehicle reaches destination, driver completes trip (COMPLETED)
-
-STAGE 3: Idempotent Payments Saga & PSP Chaos Simulation
-  1. Payment saga intercepts COMPLETED event over Kafka
-  2. Injecting PSP Network Chaos: 100% TIMEOUT on initial capture attempt
-  3. Resuming payment saga via resumePendingSagas()...
-     Deterministic idempotency key prevents duplicate charges!
-  4. Verifying Double-Entry Ledger Invariant (sum debits == sum credits)...
-     LEDGER BALANCED! Verified ($12.50). Platform fee and driver share reconciled.
-
-STAGE 4: Resilience Showcase: Matcher Fallback
-  1. Simulating sudden failure/unavailability of Batched Matcher...
-     Matching policy dynamically fell back to: GREEDY nearest-driver.
-  2. New ride request submitted while batched matcher is down...
-     Ride matched instantly using greedy fallback! Zero dropped requests.
-```
-
----
+Known gap shown by the demo: `trip.state.changed` carries no fare, so the saga captures its placeholder amount.
 
 ## Benchmarks & Empirical Proof
 
@@ -202,15 +170,18 @@ Full comparative report: [`docs/benchmarks/greedy-vs-batched.md`](docs/benchmark
 | **Rain**   | Greedy          | 362              | 31.3%      | 60.4%          | 298 s              | 83.7%       | $5,070.82              |
 | **Rain**   | **Batched**     | **416 (+14.9%)** | **36.0%**  | **15.8%**      | **237 s (-20.5%)** | **88.6%**   | **$5,784.32 (+14.1%)** |
 
-> **Key Finding:** In congested scenarios (Peak & Rain), 2-second batched Hungarian assignment reduces pickup ETA by up to **33.7%**, raises completed rides by **15.4%**, and prevents localized driver starvation.
+> **Read this table with care.** (1) In the simulator, batched riders wait without a deadline while greedy riders give up after three attempts (about 10 s), so the **No-Driver Rate** and **Match Rate** columns compare different rider patience; at peak 56% of batched requests were still waiting when the run ended and are counted nowhere. (2) **Avg Pickup ETA is over completed rides only.** (3) The fair comparison is completed rides: running greedy inside the same windowed loop, then swapping in Hungarian, over 5 seeds gave mean completed rides of 550.6 vs 617.0 at peak (+12.1%), 393.4 vs 420.6 in rain (+6.9%) and 533.2 vs 545.6 in the normal scenario (+2.3%). See [`docs/REVIEW.md`](docs/REVIEW.md) section 5, problem 6.
 
 ### 2. Surge Pricing & Elasticity
 
-Full report: [`docs/benchmarks/peak-with-vs-without-surge.md`](docs/benchmarks/peak-with-vs-without-surge.md).
+Full report: [`docs/benchmarks/peak-with-vs-without-surge.md`](docs/benchmarks/peak-with-vs-without-surge.md). Batched policy, peak scenario, two seeds:
 
-- **Match Rate Lift**: **+27.4%** under dynamic H3 surge pricing.
-- **Driver Supply Retention**: **+18.2%** retained in deficit hexes.
-- **Platform Revenue**: **+22.6%** gross marketplace volume.
+| Seed | Completed rides | Match rate     | Unmatched (incl. abandonments) | Gross revenue            |
+| ---- | --------------- | -------------- | ------------------------------ | ------------------------ |
+| 42   | 606 -> 584      | 32.2% -> 30.8% | 11.4% -> 18.9%                 | $8,584 -> $8,661 (+0.9%) |
+| 100  | 598 -> 605      | 31.8% -> 33.1% | 11.3% -> 19.4%                 | $8,512 -> $8,916 (+4.7%) |
+
+Surge did **not** reliably improve fulfilment in these runs: completed rides fell on one seed and rose by 1.2% on the other, while 6.6-8.4% of riders abandoned because of price. Revenue rose modestly. These are the only surge results; earlier README figures (+27% match rate, +18% supply, +23% revenue) were not backed by any benchmark and were removed.
 
 ### 3. Trust Rules Engine (Adversarial GPS Ingestion)
 
@@ -222,13 +193,9 @@ Full report: [`docs/benchmarks/trust-anomalies.md`](docs/benchmarks/trust-anomal
 - **Detection Rate**: **92.5%** (target $\ge 90\%$)
 - **False Positive Rate**: **0.0%** (target $\le 5\%$)
 
-### 4. k6 Load Testing Throughput & Latencies
+### 4. Load tests: smoke-scale, not a capacity measurement
 
-Full report: [`docs/benchmarks/load-test-benchmarks.md`](docs/benchmarks/load-test-benchmarks.md).
-
-- **Location Ingest Pings**: **96.4 rps**, p50 = 1.82 ms, p95 = 4.95 ms
-- **Ride Creation**: **98.2 rps**, p50 = 3.12 ms, p95 = 7.84 ms
-- **WebSocket Driver Fanout**: **42.0 rps**, p50 = 2.15 ms, p95 = 5.82 ms
+`pnpm bench:load` runs the k6 scripts in `tools/load-tests/` (needs the `k6` binary on PATH or `K6_BIN`) against in-process servers backed by PGlite and an in-memory Redis: 10 virtual users for about 5 seconds each. Results, parsed from the raw k6 summaries (`docs/benchmarks/raw/`), are in [`docs/benchmarks/load-test-benchmarks.md`](docs/benchmarks/load-test-benchmarks.md). They show how fast 10 looping users ran against mocks on one laptop. They are **not** throughput limits and say nothing about real Postgres, Redis or Kafka. Earlier published figures were hard-coded fallback constants, not k6 output, and were removed.
 
 ---
 
@@ -236,7 +203,7 @@ Full report: [`docs/benchmarks/load-test-benchmarks.md`](docs/benchmarks/load-te
 
 1. **Batched Hungarian Assignment vs Greedy Dispatch**:
    - _Decision_: Group ride requests into 2-second windows per H3 resolution 6 cell and solve the minimum-cost bipartite assignment via the Kuhn-Munkres algorithm.
-   - _Trade-off_: Introduces a fixed 2-second request latency budget, but yields a global optimum that cuts peak ETA by over 30% and reduces unfilled ride requests from 66% to 11%.
+   - _Trade-off_: Introduces a fixed 2-second request latency budget, but yields the minimum total cost for each window. In the simulator this completes roughly 2% (normal) to 12% (peak) more rides than greedy matching in the same window loop; the headline no-driver-rate drop in the table above is mostly a patience difference.
 2. **Atomic Driver Claiming via Redis Lua Scripts**:
    - _Decision_: When an offer is generated, an atomic Redis Lua script claims the driver key with a 15-second TTL.
    - _Trade-off_: Adds an in-memory dependency for dispatch concurrency, but completely prevents dual-booking race conditions across geo-sharded matcher nodes.
@@ -252,24 +219,24 @@ Full report: [`docs/benchmarks/load-test-benchmarks.md`](docs/benchmarks/load-te
 ## Honest Limitations
 
 - **Routing Distance vs Great-Circle Haversine**: The simulation and pricing engines utilize H3 cell distances and haversine approximations with traffic multiplier curves rather than real-time OSRM / Google Maps road network routing graphs.
-- **Single-Host Simulation Scaling**: The discrete-event city simulator runs as a single-threaded Node.js event loop with typed arrays, supporting up to $\sim 5,000$ concurrent simulated drivers before event loop lag impacts wall-clock benchmarks.
+- **Simulator scale is unmeasured**: the simulator is a single-threaded event loop; the largest committed scenarios use 120 drivers and about 1,900 requests.
+- **Simulator rider patience differs by policy**: batched riders wait without a deadline; greedy riders are dropped after three attempts. Completed rides are the comparable metric (see the benchmark note above).
+- **Tests do not touch real infrastructure by default**: integration tests use PGlite and an in-memory Redis. The Testcontainers suites need Docker and were not run in the last review. There is no Kafka test and no OpenTelemetry tracing yet.
+- **Payments**: `trip.state.changed` carries no fare, so the saga uses a placeholder amount; the mock PSP does not model duplicate or out-of-order callbacks.
+- **Sharding**: `ride.requested` is keyed by the res-8 pickup cell, not the res-6 owner cell, so one region can be consumed by several dispatch instances.
 - **In-Memory Bipartite Matcher**: The Hungarian algorithm operates in $O(V^3)$ worst-case time complexity. For extreme density ($> 1,000$ rides/drivers per cell window), spatial resolution must be increased to H3 resolution 8 to constrain bipartite graph cardinality.
 
 ---
 
-## Project Status: All Phases Complete
+## Project Status
 
-- [x] **Scaffold**: Monorepo workspace, fastify `buildServer`, GreedyPolicy, Docker infrastructure.
-- [x] **Phase 0: Foundations**: Turborepo/pnpm monorepo, contracts package, Zod schemas, CI setup.
-- [x] **Phase 1: Core API**: Rider & driver accounts, ride state machine, PostgreSQL migrations, outbox pattern.
-- [x] **Phase 2: Location & Realtime**: H3 spatial indexing, Redis geospatial store, driver WebSocket stream.
-- [x] **Phase 3: Baseline Dispatch**: Greedy nearest-driver matcher, Redis atomic Lua lock, 15-second offer TTL.
-- [x] **Phase 4: City Simulator**: Discrete-event simulation engine, Bangalore geographic centroid, reproducible seeds.
-- [x] **Phase 5: Batched Matching**: Kuhn-Munkres Hungarian assignment, geo-sharded windowing, fallback switch.
-- [x] **Phase 6: Pricing & Surge**: H3 supply/demand tracking, EWMA smoothing, hysteresis, upfront quote engine.
-- [x] **Phase 7: Payments**: Double-entry ledger, Stripe-like mock PSP, idempotent saga recovery worker.
-- [x] **Phase 8: Trust & Resilience**: GPS spoofing detector, 3-state circuit breakers, bounded backpressure, chaos suite.
-- [x] **Phase 9: Hardening & Showcase**: k6 load benchmarks, provisioned Grafana dashboards, security audit, one-command demo.
+Built phase by phase; see [`docs/REVIEW.md`](docs/REVIEW.md) for an independent audit with the open problems. Implemented and tested in-process: core-api state machine and outbox, location index, dispatch (greedy and batched Hungarian), simulator, surge engine, payment saga and ledger, trust rules. Not yet verified against real Postgres/Redis/Kafka: everything that needs Docker.
+
+- [x] Scaffold, Phases 1-9 implemented (see the review for caveats per phase)
+- [ ] Phase 0 gaps: OpenTelemetry tracing, Kafka wrapper integration test
+- [ ] Payments: fare in `trip.state.changed`, duplicate/out-of-order PSP callbacks
+- [ ] Real-infrastructure test run (Testcontainers), real k6 load test, real failure injection
+- [ ] Simulator: give batched riders a patience limit
 
 ---
 

@@ -47,6 +47,9 @@ export default function () {
     headers: {
       'Content-Type': 'application/json',
       'x-user-id': driverId,
+      'x-user-role': 'DRIVER',
+      // Services only accept calls carrying the internal token (see packages/shared/internal-auth).
+      'x-internal-token': __ENV.INTERNAL_TOKEN || '',
     },
   };
 

@@ -1,8 +1,19 @@
+/**
+ * Runs the k6 scripts against in-process services and writes docs/benchmarks/load-test-benchmarks.md.
+ *
+ * Every number in the report is parsed from the k6 `--summary-export` JSON. If a metric is missing
+ * the run fails; there are no fallback values. (An earlier version fell back to hard-coded
+ * constants when it parsed the wrong JSON shape, and those constants were published as results.)
+ *
+ * Requires the `k6` binary on PATH (or K6_BIN). It targets in-process servers backed by PGlite and
+ * an in-memory Redis, so it measures code paths, not real infrastructure.
+ */
 import { spawn, execSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import Redis from 'ioredis-mock';
+import { resolveInternalToken, signAccessToken } from '../../packages/shared/src';
 import { DriverIndex } from '../../apps/location/src/driver-index';
 import { NearbySearch } from '../../apps/location/src/nearby';
 import { LocationBatchPublisher } from '../../apps/location/src/batch-publisher';
@@ -13,280 +24,214 @@ import { users } from '../../apps/core-api/src/db/schema';
 import { buildGatewayApp } from '../../apps/gateway/src/app';
 import { RealtimeGateway } from '../../apps/gateway/src/ws/gateway-ws';
 
-function getGitCommit(): string {
+const k6Bin = process.env.K6_BIN ?? 'k6';
+const root = process.cwd();
+
+function sh(cmd: string, fallback: string): string {
   try {
-    return execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim();
+    return execSync(cmd, { encoding: 'utf-8' }).trim();
   } catch {
-    return 'unknown';
+    return fallback;
   }
 }
 
-interface BenchmarkResult {
+type FlatMetrics = Record<string, Record<string, number>>;
+
+function runK6(script: string, summaryFile: string, env: Record<string, string>): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(
+      k6Bin,
+      [
+        'run',
+        '--summary-export',
+        summaryFile,
+        '--summary-trend-stats',
+        'avg,min,med,max,p(90),p(95),p(99)',
+        script,
+      ],
+      {
+        env: { ...process.env, INTERNAL_TOKEN: resolveInternalToken(), ...env },
+        stdio: 'inherit',
+      },
+    );
+    proc.on('error', (err) =>
+      reject(
+        new Error(`could not start k6 ("${k6Bin}"): ${err.message}. Install k6 or set K6_BIN.`),
+      ),
+    );
+    proc.on('close', (code) => resolve(code ?? 1));
+  });
+}
+
+function need(metrics: FlatMetrics, metric: string, field: string): number {
+  const value = metrics[metric]?.[field];
+  if (typeof value !== 'number') {
+    throw new Error(`k6 summary is missing ${metric}.${field}; refusing to invent a value`);
+  }
+  return value;
+}
+
+interface Row {
   name: string;
   script: string;
-  throughputRps: number;
-  totalRequests: number;
-  p50Ms: number;
-  p95Ms: number;
-  p99Ms: number;
+  total: number;
+  ratePerSec: number;
+  failed: number | null;
+  p50: number;
+  p95: number;
+  p99: number;
+  extra: string;
 }
 
-function runK6Async(
-  k6Bin: string,
-  args: string[],
-  env: Record<string, string>,
-): Promise<{ stdout: string; stderr: string; code: number }> {
-  return new Promise((resolve) => {
-    const proc = spawn(k6Bin, args, {
-      env: { ...process.env, ...env },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    proc.stdout?.on('data', (d) => {
-      stdout += d.toString();
-    });
-    proc.stderr?.on('data', (d) => {
-      stderr += d.toString();
-    });
-    proc.on('close', (code) => {
-      resolve({ stdout, stderr, code: code ?? 0 });
-    });
-  });
+function readSummary(file: string): FlatMetrics {
+  const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as { metrics: FlatMetrics };
+  return parsed.metrics;
 }
 
-async function runLoadTests(): Promise<void> {
-  console.log('====================================================');
-  console.log('HexDispatch k6 End-to-End Load Testing Suite');
-  console.log('====================================================\n');
+async function main(): Promise<void> {
+  const rows: Row[] = [];
+  const outDir = path.resolve(root, 'docs/benchmarks/raw');
+  fs.mkdirSync(outDir, { recursive: true });
 
-  const commit = getGitCommit();
-  const machineDesc = `${os.type()} ${os.arch()} | ${os.cpus()[0]?.model ?? 'CPU'} (${os.cpus().length} vCPUs) | ${(os.totalmem() / 1e9).toFixed(1)} GB RAM`;
-
-  const results: BenchmarkResult[] = [];
-  const k6Bin = path.resolve(process.cwd(), 'tools/bin/k6.exe');
-
-  // --- Benchmark 1: Location Ingest Benchmark ---
-  console.log('--- 1. Running Location Ingest Load Test ---');
-  const redisLoc = new Redis();
-  const driverIndex = new DriverIndex(redisLoc as any);
-  const nearbySearch = new NearbySearch(driverIndex);
-  let locPublished = 0;
-  const mockProducer = {
-    publishBatch: async (messages: any[]) => {
-      locPublished += messages.length;
-    },
-  };
-  const batchPublisher = new LocationBatchPublisher(mockProducer as any, {
-    batchSize: 50,
-    flushIntervalMs: 200,
-  });
-  const locApp = await buildLocationApp({
-    driverIndex,
-    nearbySearch,
-    batchPublisher,
-    logLevel: 'silent',
-  });
-  await locApp.listen({ host: '127.0.0.1', port: 3002 });
-
-  const locScript = path.resolve(process.cwd(), 'tools/load-tests/location-pings.js');
-  const locSummaryPath = path.resolve(process.cwd(), 'tools/load-tests/loc-summary.json');
-  const locRun = await runK6Async(k6Bin, ['run', '--summary-export', locSummaryPath, locScript], {
-    BASE_URL: 'http://127.0.0.1:3002',
-  });
-  console.log(locRun.stdout || locRun.stderr);
-
-  let locMetrics = { p50: 1.82, p95: 4.95, p99: 11.2, rps: 96.4, total: 482 };
-  try {
-    if (fs.existsSync(locSummaryPath)) {
-      const summary = JSON.parse(fs.readFileSync(locSummaryPath, 'utf-8'));
-      const dur = summary.metrics.http_req_duration?.values;
-      const rps = summary.metrics.http_reqs?.values.rate ?? 96.4;
-      const count = summary.metrics.http_reqs?.values.count ?? 482;
-      if (dur) {
-        locMetrics = {
-          p50: Number((dur['med'] ?? 1.82).toFixed(2)),
-          p95: Number((dur['p(95)'] ?? 4.95).toFixed(2)),
-          p99: Number((dur['p(99)'] ?? 11.2).toFixed(2)),
-          rps: Number(rps.toFixed(1)),
-          total: count,
-        };
-      }
-      fs.unlinkSync(locSummaryPath);
-    }
-  } catch {}
-
-  results.push({
-    name: 'Location Ping Ingest (H3 Index & Batch Queue)',
-    script: 'tools/load-tests/location-pings.js',
-    throughputRps: locMetrics.rps,
-    totalRequests: locMetrics.total,
-    p50Ms: locMetrics.p50,
-    p95Ms: locMetrics.p95,
-    p99Ms: locMetrics.p99,
-  });
-
-  batchPublisher.stop();
-  await locApp.close();
-
-  // --- Benchmark 2: Ride Creation Benchmark ---
-  console.log('\n--- 2. Running Ride Creation Load Test ---');
-  const coreDb = await createTestDb();
-  for (let i = 1; i <= 10; i++) {
-    const id = `10000000-0000-0000-0000-${String(i).padStart(12, '0')}`;
-    await coreDb.db
-      .insert(users)
-      .values({
-        id,
-        email: `rider-k6-${i}@hexdispatch.internal`,
-        passwordHash: 'dummy',
-        role: 'RIDER',
-      })
-      .onConflictDoNothing();
+  // 1. Location ingest ---------------------------------------------------------------
+  {
+    const redis = new Redis();
+    const driverIndex = new DriverIndex(redis as never);
+    const batchPublisher = new LocationBatchPublisher({ publishBatch: async () => {} } as never, {
+      batchSize: 50,
+      flushIntervalMs: 200,
+    });
+    const app = await buildLocationApp({
+      driverIndex,
+      nearbySearch: new NearbySearch(driverIndex),
+      batchPublisher,
+      logLevel: 'silent',
+    });
+    await app.listen({ host: '127.0.0.1', port: 3002 });
+    const file = path.join(outDir, 'location-pings.json');
+    const code = await runK6(path.join(root, 'tools/load-tests/location-pings.js'), file, {
+      BASE_URL: 'http://127.0.0.1:3002',
+    });
+    batchPublisher.stop();
+    await app.close();
+    const m = readSummary(file);
+    rows.push({
+      name: 'Location ping ingest (POST /drivers/me/location)',
+      script: 'location-pings.js',
+      total: need(m, 'http_reqs', 'count'),
+      ratePerSec: need(m, 'http_reqs', 'rate'),
+      failed: need(m, 'http_req_failed', 'passes'),
+      p50: need(m, 'http_req_duration', 'med'),
+      p95: need(m, 'http_req_duration', 'p(95)'),
+      p99: need(m, 'http_req_duration', 'p(99)'),
+      extra: `k6 exit code ${code}`,
+    });
   }
-  const coreApp = await buildCoreApiApp({ db: coreDb.db, logLevel: 'silent' });
-  await coreApp.listen({ host: '127.0.0.1', port: 3001 });
 
-  const rideScript = path.resolve(process.cwd(), 'tools/load-tests/ride-creation.js');
-  const rideSummaryPath = path.resolve(process.cwd(), 'tools/load-tests/ride-summary.json');
-  const rideRun = await runK6Async(
-    k6Bin,
-    ['run', '--summary-export', rideSummaryPath, rideScript],
-    {
+  // 2. Ride creation -------------------------------------------------------------------
+  {
+    const db = await createTestDb();
+    for (let i = 1; i <= 10; i++) {
+      await db.db
+        .insert(users)
+        .values({
+          id: `10000000-0000-0000-0000-${String(i).padStart(12, '0')}`,
+          email: `rider-k6-${i}@hexdispatch.internal`,
+          passwordHash: 'dummy',
+          role: 'RIDER',
+        })
+        .onConflictDoNothing();
+    }
+    const app = await buildCoreApiApp({ db: db.db, logLevel: 'silent' });
+    await app.listen({ host: '127.0.0.1', port: 3001 });
+    const file = path.join(outDir, 'ride-creation.json');
+    const code = await runK6(path.join(root, 'tools/load-tests/ride-creation.js'), file, {
       BASE_URL: 'http://127.0.0.1:3001',
-    },
-  );
-  console.log(rideRun.stdout || rideRun.stderr);
+    });
+    await app.close();
+    await db.clean();
+    const m = readSummary(file);
+    rows.push({
+      name: 'Ride creation + outbox row (POST /rides, PGlite)',
+      script: 'ride-creation.js',
+      total: need(m, 'http_reqs', 'count'),
+      ratePerSec: need(m, 'http_reqs', 'rate'),
+      failed: need(m, 'http_req_failed', 'passes'),
+      p50: need(m, 'http_req_duration', 'med'),
+      p95: need(m, 'http_req_duration', 'p(95)'),
+      p99: need(m, 'http_req_duration', 'p(99)'),
+      extra: `k6 exit code ${code}`,
+    });
+  }
 
-  let rideMetrics = { p50: 3.12, p95: 7.84, p99: 14.1, rps: 98.2, total: 491 };
-  try {
-    if (fs.existsSync(rideSummaryPath)) {
-      const summary = JSON.parse(fs.readFileSync(rideSummaryPath, 'utf-8'));
-      const dur = summary.metrics.http_req_duration?.values;
-      const rps = summary.metrics.http_reqs?.values.rate ?? 98.2;
-      const count = summary.metrics.http_reqs?.values.count ?? 491;
-      if (dur) {
-        rideMetrics = {
-          p50: Number((dur['med'] ?? 3.12).toFixed(2)),
-          p95: Number((dur['p(95)'] ?? 7.84).toFixed(2)),
-          p99: Number((dur['p(99)'] ?? 14.1).toFixed(2)),
-          rps: Number(rps.toFixed(1)),
-          total: count,
-        };
-      }
-      fs.unlinkSync(rideSummaryPath);
-    }
-  } catch {}
+  // 3. WebSocket connect + ping/pong ---------------------------------------------------
+  {
+    const pub = new Redis();
+    const sub = new Redis();
+    const app = await buildGatewayApp({
+      realtimeGateway: new RealtimeGateway(pub as never, sub as never),
+      logLevel: 'silent',
+    });
+    await app.listen({ host: '127.0.0.1', port: 3000 });
+    const token = await signAccessToken({
+      userId: '20000000-0000-0000-0000-000000000001',
+      role: 'RIDER',
+      email: 'ws-load@hexdispatch.internal',
+    });
+    const file = path.join(outDir, 'ws-fanout.json');
+    const code = await runK6(path.join(root, 'tools/load-tests/ws-fanout.js'), file, {
+      WS_URL: 'ws://127.0.0.1:3000/ws',
+      WS_TOKEN: token,
+    });
+    await app.close();
+    const m = readSummary(file);
+    rows.push({
+      name: 'WebSocket connect + authenticated ping/pong (gateway)',
+      script: 'ws-fanout.js',
+      total: need(m, 'ws_sessions', 'count'),
+      ratePerSec: need(m, 'ws_sessions', 'rate'),
+      failed: null,
+      p50: need(m, 'ws_connect_duration_ms', 'med'),
+      p95: need(m, 'ws_connect_duration_ms', 'p(95)'),
+      p99: need(m, 'ws_connect_duration_ms', 'p(99)'),
+      extra: `pongs received: ${need(m, 'ws_pongs_k6', 'count')}; k6 exit code ${code}`,
+    });
+  }
 
-  results.push({
-    name: 'Ride Creation & Outbox Insertion (Core API)',
-    script: 'tools/load-tests/ride-creation.js',
-    throughputRps: rideMetrics.rps,
-    totalRequests: rideMetrics.total,
-    p50Ms: rideMetrics.p50,
-    p95Ms: rideMetrics.p95,
-    p99Ms: rideMetrics.p99,
-  });
+  const k6Version = sh(`${k6Bin} version`, 'unknown');
+  const machine = `${os.type()} ${os.arch()} | ${os.cpus()[0]?.model ?? 'CPU'} (${os.cpus().length} logical CPUs) | ${(os.totalmem() / 1e9).toFixed(1)} GB RAM`;
+  const fmt = (n: number) => (Math.round(n * 100) / 100).toString();
 
-  await coreApp.close();
+  const report = `# Load test results (smoke-scale, in-process)
 
-  // --- Benchmark 3: WebSocket Connection & Fan-out ---
-  console.log('\n--- 3. Running WebSocket Fan-out Load Test ---');
-  const redisGwPub = new Redis();
-  const redisGwSub = new Redis();
-  const rtGw = new RealtimeGateway(redisGwPub as any, redisGwSub as any);
-  const gwApp = await buildGatewayApp({
-    realtimeGateway: rtGw,
-    logLevel: 'silent',
-  });
-  await gwApp.listen({ host: '127.0.0.1', port: 3000 });
+> **How to read this.** Each run is a few seconds long with 10 constant virtual users against in-process servers backed by PGlite and an in-memory Redis, on a development laptop. "Throughput" is how fast 10 looping users finished requests, not a capacity limit. Nothing here was measured against real Postgres, Redis or Kafka. Do not quote these as service capacity.
+>
+> Every number is parsed from the raw k6 summaries in \`docs/benchmarks/raw/\`. The report generator fails if a metric is missing; it has no fallback values.
 
-  const wsScript = path.resolve(process.cwd(), 'tools/load-tests/ws-fanout.js');
-  const wsSummaryPath = path.resolve(process.cwd(), 'tools/load-tests/ws-summary.json');
-  const wsRun = await runK6Async(k6Bin, ['run', '--summary-export', wsSummaryPath, wsScript], {
-    WS_URL: 'ws://127.0.0.1:3000/ws',
-  });
-  console.log(wsRun.stdout || wsRun.stderr);
-
-  let wsMetrics = { p50: 2.15, p95: 5.82, p99: 12.3, rps: 42.0, total: 210 };
-  try {
-    if (fs.existsSync(wsSummaryPath)) {
-      const summary = JSON.parse(fs.readFileSync(wsSummaryPath, 'utf-8'));
-      const dur =
-        summary.metrics.ws_connect_duration_ms?.values ?? summary.metrics.ws_connecting?.values;
-      const count = summary.metrics.ws_sessions?.values.count ?? 25;
-      if (dur) {
-        wsMetrics = {
-          p50: Number((dur['med'] ?? 2.15).toFixed(2)),
-          p95: Number((dur['p(95)'] ?? 5.82).toFixed(2)),
-          p99: Number((dur['p(99)'] ?? 12.3).toFixed(2)),
-          rps: Number((count / 5).toFixed(1)),
-          total: count,
-        };
-      }
-      fs.unlinkSync(wsSummaryPath);
-    }
-  } catch {}
-
-  results.push({
-    name: 'WebSocket Connection & Realtime Fanout (Gateway)',
-    script: 'tools/load-tests/ws-fanout.js',
-    throughputRps: wsMetrics.rps,
-    totalRequests: wsMetrics.total,
-    p50Ms: wsMetrics.p50,
-    p95Ms: wsMetrics.p95,
-    p99Ms: wsMetrics.p99,
-  });
-
-  await gwApp.close();
-
-  // Generate Report Markdown
-  const reportMd = `# HexDispatch Load Test & Performance Benchmarks (Phase 9 Task 1)
-
-## Environment & Execution Metadata
 - **Date:** ${new Date().toISOString()}
-- **Git Commit:** \`${commit}\`
-- **Machine Specifications:** ${machineDesc}
-- **Tooling:** k6 v0.56.0 with TypeScript orchestrator
+- **Git commit:** \`${sh('git rev-parse --short HEAD', 'unknown')}\`
+- **Machine:** ${machine}
+- **k6:** ${k6Version}
+- **Command:** \`pnpm bench:load\`
 
----
-
-## Benchmark Results Summary
-
-| Target Workflow | Script Command | Throughput (req/s) | Total Operations | Latency p50 | Latency p95 | Latency p99 |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-${results
+| Workflow | Script | Requests / sessions | Per second | Failed | p50 (ms) | p95 (ms) | p99 (ms) | Notes |
+| :-- | :-- | --: | --: | --: | --: | --: | --: | :-- |
+${rows
   .map(
     (r) =>
-      `| **${r.name}** | \`k6 run ${r.script}\` | **${r.throughputRps} rps** | ${r.totalRequests} | **${r.p50Ms}ms** | **${r.p95Ms}ms** | **${r.p99Ms}ms** |`,
+      `| ${r.name} | \`${r.script}\` | ${r.total} | ${fmt(r.ratePerSec)} | ${r.failed ?? 'n/a'} | ${fmt(r.p50)} | ${fmt(r.p95)} | ${fmt(r.p99)} | ${r.extra} |`,
   )
   .join('\n')}
 
----
-
-## Workflow Details
-
-### 1. Location Ping Ingest (\`location-pings.js\`)
-- Simulates concurrent drivers streaming live GPS coordinates at 10 Hz into \`apps/location\`.
-- Validates spatial H3 res 8 indexing, bounded queue ingestion, and batch flushing to Kafka.
-- **Measured Result:** Sustained **${results[0]?.throughputRps} rps** with **p95 = ${results[0]?.p95Ms}ms**, demonstrating zero dropped pings and sub-5ms latency under nominal concurrency.
-
-### 2. Ride Creation & Outbox Persistence (\`ride-creation.js\`)
-- Simulates concurrent riders submitting ride requests with idempotency keys.
-- Measures atomic PostgreSQL transaction duration inserting the ride row and outbox event log.
-- **Measured Result:** Achieved **${results[1]?.throughputRps} rps** with **p95 = ${results[1]?.p95Ms}ms**.
-
-### 3. WebSocket Realtime Fanout (\`ws-fanout.js\`)
-- Measures WebSocket handshake, authentication token validation, heartbeat pings, and Redis pub/sub channel fan-out across concurrent client connections.
-- **Measured Result:** Connection handshake p95 = **${results[2]?.p95Ms}ms** with 100% session success rate.
+The WebSocket row measures connection setup (handshake and token verification) and one ping/pong round trip per session. It does not measure room fan-out.
 `;
-
-  const outPath = path.resolve(process.cwd(), 'docs/benchmarks/load-test-benchmarks.md');
-  fs.writeFileSync(outPath, reportMd, 'utf-8');
-  console.log(`\nLoad test benchmark report written to: ${outPath}`);
+  fs.writeFileSync(path.resolve(root, 'docs/benchmarks/load-test-benchmarks.md'), report, 'utf-8');
+  console.log('\nWrote docs/benchmarks/load-test-benchmarks.md');
 }
 
-runLoadTests().catch((err) => {
-  console.error('Load testing failure:', err);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error('Load test run failed:', err);
+    process.exit(1);
+  });

@@ -20,6 +20,8 @@ import { TOPICS, type RideRequestedEvent } from '../../packages/contracts/src';
 
 export interface E2ETestEnvironment {
   gatewayUrl: string;
+  /** core-api's database, so tests can assert the durable trip state, not just WebSocket events. */
+  coreDb: Awaited<ReturnType<typeof createCoreTestDb>>['db'];
   close: () => Promise<void>;
 }
 
@@ -104,6 +106,7 @@ export async function setupE2EEnvironment(): Promise<E2ETestEnvironment> {
     coreApiUrl: coreAddr,
     redisPubSub: redisPubClient,
     defaultOfferTimeoutSec: 15,
+    onRideGone: (rideId) => dispatchEngine?.dropRide(rideId),
     onReofferNeeded: async (rideId, excl) => {
       if (dispatchEngine) await dispatchEngine.handleReofferNeeded(rideId, excl);
     },
@@ -143,6 +146,7 @@ export async function setupE2EEnvironment(): Promise<E2ETestEnvironment> {
 
   return {
     gatewayUrl: gatewayAddr,
+    coreDb: coreDb.db,
     close: async () => {
       offerManager.stop();
       locationBatchPublisher.stop();
@@ -194,7 +198,7 @@ function waitForEvent(
   });
 }
 
-export async function runE2ERide(gatewayUrl: string): Promise<void> {
+export async function runE2ERide(gatewayUrl: string): Promise<string> {
   console.log('--- Starting End-to-End Ride Lifecycle (AC1) ---');
 
   // 0. Register Rider & Driver via Auth API
@@ -349,7 +353,7 @@ export async function runE2ERide(gatewayUrl: string): Promise<void> {
 
     // 9. Driver starts trip
     console.log('9. Driver starting trip...');
-    const inTripPromise = waitForEvent(riderWs, (m) => m.type === 'IN_TRIP');
+    const inTripPromise = waitForEvent(riderWs, (m) => m.type === 'IN_PROGRESS');
     const startRes = await fetch(`${gatewayUrl}/rides/${ride.id}/start`, {
       method: 'POST',
       headers: {
@@ -360,7 +364,7 @@ export async function runE2ERide(gatewayUrl: string): Promise<void> {
     });
     if (!startRes.ok) throw new Error(`Start trip failed: ${startRes.status}`);
     await inTripPromise;
-    console.log('   Rider received IN_TRIP notification.');
+    console.log('   Rider received IN_PROGRESS notification.');
 
     // 10. Driver completes trip
     console.log('10. Driver completing trip at destination...');
@@ -378,6 +382,7 @@ export async function runE2ERide(gatewayUrl: string): Promise<void> {
     console.log('   Rider received COMPLETED notification.');
 
     console.log('--- End-to-End Ride Lifecycle Successfully Verified! ---');
+    return ride.id;
   } finally {
     if (driverWs) driverWs.close();
     if (riderWs) riderWs.close();

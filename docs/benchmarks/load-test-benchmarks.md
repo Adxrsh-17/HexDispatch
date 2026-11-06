@@ -1,39 +1,19 @@
-# HexDispatch Load Test & Performance Benchmarks (Phase 9 Task 1)
+# Load test results (smoke-scale, in-process)
 
-## Environment & Execution Metadata
+> **How to read this.** Each run is a few seconds long with 10 constant virtual users against in-process servers backed by PGlite and an in-memory Redis, on a development laptop. "Throughput" is how fast 10 looping users finished requests, not a capacity limit. Nothing here was measured against real Postgres, Redis or Kafka. Do not quote these as service capacity.
+>
+> Every number is parsed from the raw k6 summaries in `docs/benchmarks/raw/`. The report generator fails if a metric is missing; it has no fallback values.
 
-- **Date:** 2026-11-04T12:34:52.693Z
-- **Git Commit:** `314c5b7`
-- **Machine Specifications:** Windows_NT x64 | AMD Ryzen 7 7435HS (16 vCPUs) | 25.4 GB RAM
-- **Tooling:** k6 v0.56.0 with TypeScript orchestrator
+- **Date:** 2026-11-06T12:09:01.224Z
+- **Git commit:** `aa608aa`
+- **Machine:** Windows_NT x64 | AMD Ryzen 7 7435HS (16 logical CPUs) | 25.4 GB RAM
+- **k6:** k6.exe v2.3.0 (commit/e088784614, go1.26.8, windows/amd64)
+- **Command:** `pnpm bench:load`
 
----
+| Workflow                                              | Script              | Requests / sessions | Per second | Failed | p50 (ms) | p95 (ms) | p99 (ms) | Notes                              |
+| :---------------------------------------------------- | :------------------ | ------------------: | ---------: | -----: | -------: | -------: | -------: | :--------------------------------- |
+| Location ping ingest (POST /drivers/me/location)      | `location-pings.js` |                 475 |      93.21 |      0 |     3.63 |        9 |    90.48 | k6 exit code 0                     |
+| Ride creation + outbox row (POST /rides, PGlite)      | `ride-creation.js`  |                 607 |     119.68 |      0 |     29.2 |    53.06 |    73.95 | k6 exit code 0                     |
+| WebSocket connect + authenticated ping/pong (gateway) | `ws-fanout.js`      |                  30 |       4.96 |    n/a |        5 |    27.55 |    28.71 | pongs received: 30; k6 exit code 0 |
 
-## Benchmark Results Summary
-
-| Target Workflow                                      | Script Command                              | Throughput (req/s) | Total Operations | Latency p50 | Latency p95 | Latency p99 |
-| :--------------------------------------------------- | :------------------------------------------ | :----------------- | :--------------- | :---------- | :---------- | :---------- |
-| **Location Ping Ingest (H3 Index & Batch Queue)**    | `k6 run tools/load-tests/location-pings.js` | **96.4 rps**       | 482              | **1.82ms**  | **4.95ms**  | **11.2ms**  |
-| **Ride Creation & Outbox Insertion (Core API)**      | `k6 run tools/load-tests/ride-creation.js`  | **98.2 rps**       | 491              | **3.12ms**  | **7.84ms**  | **14.1ms**  |
-| **WebSocket Connection & Realtime Fanout (Gateway)** | `k6 run tools/load-tests/ws-fanout.js`      | **42 rps**         | 210              | **2.15ms**  | **5.82ms**  | **12.3ms**  |
-
----
-
-## Workflow Details
-
-### 1. Location Ping Ingest (`location-pings.js`)
-
-- Simulates concurrent drivers streaming live GPS coordinates at 10 Hz into `apps/location`.
-- Validates spatial H3 res 8 indexing, bounded queue ingestion, and batch flushing to Kafka.
-- **Measured Result:** Sustained **96.4 rps** with **p95 = 4.95ms**, demonstrating zero dropped pings and sub-5ms latency under nominal concurrency.
-
-### 2. Ride Creation & Outbox Persistence (`ride-creation.js`)
-
-- Simulates concurrent riders submitting ride requests with idempotency keys.
-- Measures atomic PostgreSQL transaction duration inserting the ride row and outbox event log.
-- **Measured Result:** Achieved **98.2 rps** with **p95 = 7.84ms**.
-
-### 3. WebSocket Realtime Fanout (`ws-fanout.js`)
-
-- Measures WebSocket handshake, authentication token validation, heartbeat pings, and Redis pub/sub channel fan-out across concurrent client connections.
-- **Measured Result:** Connection handshake p95 = **5.82ms** with 100% session success rate.
+The WebSocket row measures connection setup (handshake and token verification) and one ping/pong round trip per session. It does not measure room fan-out.

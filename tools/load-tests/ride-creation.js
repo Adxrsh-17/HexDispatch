@@ -36,6 +36,9 @@ export default function () {
     headers: {
       'Content-Type': 'application/json',
       'x-user-id': riderId,
+      'x-user-role': 'RIDER',
+      // Services only accept calls carrying the internal token (see packages/shared/internal-auth).
+      'x-internal-token': __ENV.INTERNAL_TOKEN || '',
       'idempotency-key': idempotencyKey,
     },
   };

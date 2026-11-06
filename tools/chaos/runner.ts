@@ -38,64 +38,39 @@ export async function runAllChaosScenarios(): Promise<ChaosResult[]> {
 
 export function generateResilienceMarkdown(results: ChaosResult[]): string {
   const timestamp = new Date().toISOString();
-  return `# HexDispatch System Resilience & Failure Injection Report
+  const cell = (r: ChaosResult) =>
+    r.status === 'MEASURED' ? `${r.containerRecoveryMs} ms` : `NOT RUN (${r.reason})`;
 
-## Overview
-This document records failure injection and chaos engineering outcomes across all critical infrastructure and microservices in HexDispatch, as required by Phase 8 Acceptance Criterion 2.
+  return `# HexDispatch Failure Injection Report
 
-**Audit Date:** ${timestamp}  
-**Architecture Guardrails:** Outbox Pattern, Double-Entry Ledger, Idempotency Keys, Circuit Breakers, Bounded Queues.
+**Generated:** ${timestamp}
+**Command:** \`pnpm chaos\`
 
----
+## What this report is, and is not
 
-## Failure Scenarios Summary
+- **Measured** means one thing: the time from \`docker stop\` of a dependency container until its health probe passes again after \`docker start\`. That is infrastructure recovery time.
+- **Not measured:** how HexDispatch services behave during the outage, and whether any data is lost. The "Expected behaviour" column is design intent taken from the code, not an observation. Backing it with assertions against running services is open work.
+- A scenario that cannot run says **NOT RUN** and gives the reason. This runner never fabricates a number. (An earlier version did: it slept for a fixed time when Docker was absent and reported that as a recovery time. Those figures were removed.)
 
-| Target Subsystem | Failure Injected | Degraded Behaviour | Data Loss? | Measured Recovery Time |
-| :--- | :--- | :--- | :--- | :--- |
-${results
-  .map(
-    (r) =>
-      `| **${r.target}** | \`${r.scenario}\` | ${r.expectedDegraded.slice(0, 75)}... | **${r.dataLoss ? 'YES' : 'NO'}** | **${r.recoveryTimeMs}ms** |`,
-  )
-  .join('\n')}
+## Results
 
----
+| Scenario | Target | Container recovery | Expected behaviour (design intent, not observed) |
+| :--- | :--- | :--- | :--- |
+${results.map((r) => `| \`${r.scenario}\` | ${r.target} | ${cell(r)} | ${r.expectedBehaviour} |`).join('\n')}
 
-## Detailed Scenario Findings
+## Where restart and failure behaviour is actually tested
 
-${results
-  .map(
-    (r, idx) => `### ${idx + 1}. Scenario: \`${r.scenario}\` (${r.target})
-- **Expected Degraded Behaviour:**  
-  ${r.expectedDegraded}
-- **Observed Behaviour During Outage:**  
-  ${r.observedDegraded}
-- **Data Loss:** **${r.dataLoss ? 'YES' : 'NO'}**  
-  *Details:* ${r.dataLossDetails}
-- **Measured Recovery Time:** **${r.recoveryTimeMs}ms**
-`,
-  )
-  .join('\n')}
+These are automated tests in the repository, run with \`pnpm test\` (in-process, on PGlite and an in-memory Redis, not on real containers):
 
----
+- Offer accept/decline/expire races, core-api refusal handling, claim atomicity: \`apps/dispatch/test/hardening.test.ts\`
+- Dispatch restart with a pending offer: \`apps/dispatch/test/recovery.test.ts\`
+- Dispatch restart with pending (not yet offered) rides, solver failure and slow-solve fallback: \`apps/dispatch/test/hardening.test.ts\`
+- Payment saga resume after a crash mid-step: \`apps/payment/test/saga-recovery.test.ts\`
+- Outbox relay: \`apps/core-api/test/outbox-relay.test.ts\`
 
-## Resilience Architecture Principles
+## Not yet tested against real infrastructure
 
-1. **Transactional Outbox for Asynchronous Messaging:**
-   - Every domain event in \`core-api\` is written into PostgreSQL in the same database transaction as the business entity update.
-   - When Kafka/Redpanda is partitioned or offline, business operations continue without data loss; events accumulate in the outbox table and are drained causally once the broker recovers.
-
-2. **Decoupled Durability (PostgreSQL) vs Ephemeral State (Redis):**
-   - Core financial records, trip states, and audit trails reside in PostgreSQL.
-   - Redis holds spatial indexes and atomic driver lock claims with TTLs. If Redis crashes, claims safely expire, preventing permanent deadlocks. Spatial indexes repopulate rapidly as active drivers stream GPS pings.
-
-3. **Circuit Breakers on Synchronous Cross-Service HTTP:**
-   - Gateway and dispatch enforce circuit breakers (\`CLOSED\` -> \`OPEN\` -> \`HALF_OPEN\`) with strict timeouts (3000ms) and fallbacks.
-   - Microservice downtime fails fast (503 Service Unavailable) rather than cascading thread exhaustion or hanging socket buffers.
-
-4. **Saga Resumption & PSP Idempotency:**
-   - Payment sagas survive mid-step service crashes and process restarts via \`resumePendingSagas()\`.
-   - Deterministic idempotency keys (\`auth:\${rideId}\`, \`capture:\${rideId}\`) prevent duplicate financial charges across retries and network timeouts.
+Real Postgres, Redis and Kafka failure behaviour. The \`*.testcontainers.test.ts\` suites exist but need Docker.
 `;
 }
 
