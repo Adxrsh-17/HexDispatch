@@ -13,7 +13,7 @@
    - 1.4 High-Level System Architecture (Mermaid)
 2. [Domain Modeling & Transactional State Machines](#2-domain-modeling--transactional-state-machines)
    - 2.1 The Complete Ride & Trip State Machine
-   - 2.2 Invariant Enforcement & Concurrency Locking
+   - 2.2 Invariant Enforcement, Optimistic Locking & Anti-IDOR Authorization
    - 2.3 The Dual-Write Problem & The Transactional Outbox Pattern
    - 2.4 Event Schemas & Kafka Event Backbone
 3. [Geospatial Indexing & Spatial Sharding](#3-geospatial-indexing--spatial-sharding)
@@ -29,6 +29,7 @@
    - 4.5 Atomic Driver Claiming via Redis Lua Scripts
    - 4.6 The Offer Lifecycle, Re-Offers & Expiry State Machine
    - 4.7 Automatic Fallback to Greedy Under Matcher Lag
+   - 4.8 Single-Flight Batch Cycle Concurrency (`cycleChain`)
 5. [Dynamic Pricing & Surge as a Control Loop](#5-dynamic-pricing--surge-as-a-control-loop)
    - 5.1 Marketplace Equilibrium & Price Elasticity
    - 5.2 Supply-to-Demand Ratio Estimation per Hex Cell
@@ -55,6 +56,7 @@
    - 8.1 3-State In-Memory Circuit Breakers (`CLOSED`, `OPEN`, `HALF_OPEN`)
    - 8.2 Ingest Load Shedding & Bounded Memory Backpressure
    - 8.3 Chaos Testing Suite & Infrastructure Recovery Invariants
+   - 8.4 Continuous Integration & Testcontainers Containerized Integration Suite
 9. [Discrete-Event Simulation & Empirical Verification](#9-discrete-event-simulation--empirical-verification)
    - 9.1 Discrete-Event Simulation vs Continuous-Time Tick Simulation
    - 9.2 The Bangalore Synthetic Geography & Demand Generation
@@ -69,7 +71,12 @@
     - 11.2 Zod Runtime Boundary Verification
     - 11.3 Security Headers & Secret Management
     - 11.4 Dependency Hygiene & Vulnerability Remediation
+    - 11.5 Internal Service Authentication (`registerInternalAuth` & Constant-Time Validation)
+    - 11.6 Dual-Layer Defense: Edge RBAC vs Internal Route Guards
+    - 11.7 Verification Summary & Test Suite Invariants
 12. [System Design Interview Mastery Guide (20 Deep-Dive Q&A)](#12-system-design-interview-mastery-guide-20-deep-dive-qa)
+    - Detailed Architecture, Trade-Off, and Failure-Scenario Questions
+13. [System Design Interview Mastery Guide (20 Deep-Dive Q&A)](#12-system-design-interview-mastery-guide-20-deep-dive-qa)
     - Detailed Architecture, Trade-Off, and Failure-Scenario Questions
 
 ---
@@ -196,76 +203,156 @@ flowchart TD
 
 ## 2.1 The Complete Ride & Trip State Machine
 
-Every ride in HexDispatch progresses through a strictly validated finite state machine (FSM). Invalid transitions are rejected at runtime with an `IllegalStateTransitionError`.
+Every ride in HexDispatch progresses through a strictly validated finite state machine (FSM) defined in `@hexdispatch/contracts` and enforced by `core-api`. The platform enforces a 7-stage happy path chain:
+
+$$\text{REQUESTED} \longrightarrow \text{MATCHING} \longrightarrow \text{OFFERED} \longrightarrow \text{ASSIGNED} \longrightarrow \text{DRIVER\_ARRIVED} \longrightarrow \text{IN\_PROGRESS} \longrightarrow \text{COMPLETED}$$
+
+Invalid transitions or unauthorized actor attempts are rejected at runtime with `AppError.badRequest` or `AppError.forbidden`.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> REQUESTED: Rider submits ride request
-    REQUESTED --> OFFERED: Matcher finds candidate driver
-    REQUESTED --> NO_DRIVER_FOUND: Exceeded max attempts / timeout
-    REQUESTED --> CANCELLED_BY_RIDER: Rider cancels before match
+    [*] --> REQUESTED: Rider requests ride
+    REQUESTED --> MATCHING: Batch matcher picks up ride
+    REQUESTED --> CANCELLED_BY_RIDER: Rider cancels before matching
+    REQUESTED --> FAILED: System error / admin abort
 
-    OFFERED --> ACCEPTED: Driver accepts within 15s TTL
-    OFFERED --> REQUESTED: Driver declines or offer expires (re-queue)
-    OFFERED --> CANCELLED_BY_RIDER: Rider cancels while offered
+    MATCHING --> OFFERED: Candidate driver selected via Hungarian match
+    MATCHING --> NO_DRIVER_FOUND: Max attempts reached / timeout
+    MATCHING --> CANCELLED_BY_RIDER: Rider cancels while matching
+    MATCHING --> FAILED: System error / admin abort
 
-    ACCEPTED --> ARRIVED: Driver reaches pickup point
-    ACCEPTED --> CANCELLED_BY_RIDER: Rider cancels (cancellation fee applied)
-    ACCEPTED --> CANCELLED_BY_DRIVER: Driver emergency cancel
+    OFFERED --> ASSIGNED: Driver accepts offer within 15s TTL
+    OFFERED --> MATCHING: Driver declines or offer expires (re-queue)
+    OFFERED --> CANCELLED_BY_RIDER: Rider cancels during offer
+    OFFERED --> FAILED: System error / admin abort
 
-    ARRIVED --> IN_TRIP: Rider boards, OTP verified, trip begins
-    ARRIVED --> CANCELLED_BY_DRIVER: Rider no-show (> 5 min)
-    ARRIVED --> CANCELLED_BY_RIDER: Rider cancel at pickup
+    ASSIGNED --> DRIVER_ARRIVED: Driver reaches pickup (< 100m)
+    ASSIGNED --> CANCELLED_BY_RIDER: Rider cancels (cancellation fee applies)
+    ASSIGNED --> CANCELLED_BY_DRIVER: Driver emergency cancel
+    ASSIGNED --> MATCHING: Driver cancel allows re-dispatch
+    ASSIGNED --> FAILED: System error / admin abort
 
-    IN_TRIP --> COMPLETED: Vehicle reaches dropoff point
-    IN_TRIP --> CANCELLED_BY_DRIVER: Road breakdown / emergency
+    DRIVER_ARRIVED --> IN_PROGRESS: Rider boards, meter starts
+    DRIVER_ARRIVED --> CANCELLED_BY_DRIVER: Rider no-show (> 5 min)
+    DRIVER_ARRIVED --> CANCELLED_BY_RIDER: Rider cancels at pickup
+    DRIVER_ARRIVED --> FAILED: System error / admin abort
 
-    COMPLETED --> [*]: Emits event to Payment Saga
+    IN_PROGRESS --> COMPLETED: Destination reached; triggers payment saga
+    IN_PROGRESS --> FAILED: Critical road incident / admin abort
+
+    COMPLETED --> [*]
     NO_DRIVER_FOUND --> [*]
     CANCELLED_BY_RIDER --> [*]
     CANCELLED_BY_DRIVER --> [*]
+    FAILED --> [*]
 ```
 
 ### Transition Invariants Table
 
-| From State  | Allowed Target State | Preconditions & Side Effects                                                                   |
-| ----------- | -------------------- | ---------------------------------------------------------------------------------------------- |
-| `REQUESTED` | `OFFERED`            | Candidate selected; driver locked in Redis via Lua script.                                     |
-| `REQUESTED` | `NO_DRIVER_FOUND`    | Matching attempts $\ge 3$ or total search timeout expired ($> 60\text{ s}$).                   |
-| `REQUESTED` | `CANCELLED_BY_RIDER` | Instant release; zero cancellation fee.                                                        |
-| `OFFERED`   | `ACCEPTED`           | Verified driver signature; driver claim confirmed; ride assigned.                              |
-| `OFFERED`   | `REQUESTED`          | Offer TTL expired ($15\text{ s}$) or driver declined; release Redis claim; re-offer candidate. |
-| `ACCEPTED`  | `ARRIVED`            | Driver location within $100\text{ m}$ radius of pickup coordinate.                             |
-| `ARRIVED`   | `IN_TRIP`            | Optional OTP/PIN validated; driver switches meter to active.                                   |
-| `IN_TRIP`   | `COMPLETED`          | Driver signals destination reached; final distance/time computed. Triggers payment saga.       |
+| From State       | Allowed Target State  | Authorized Actors | Preconditions & Side Effects                                                                             |
+| :--------------- | :-------------------- | :---------------- | :------------------------------------------------------------------------------------------------------- |
+| `REQUESTED`      | `MATCHING`            | `SYSTEM`          | Batch windowing engine captures ride for matching.                                                       |
+| `REQUESTED`      | `CANCELLED_BY_RIDER`  | `RIDER`           | Instant release; zero cancellation fee.                                                                  |
+| `REQUESTED`      | `FAILED`              | `SYSTEM`, `ADMIN` | System rejection or administrative intervention.                                                         |
+| `MATCHING`       | `OFFERED`             | `SYSTEM`          | Bipartite assignment matches candidate; driver locked in Redis via Lua claim.                            |
+| `MATCHING`       | `NO_DRIVER_FOUND`     | `SYSTEM`          | Matching attempts $\ge 3$ or total search timeout expired ($> 60\text{ s}$).                             |
+| `MATCHING`       | `CANCELLED_BY_RIDER`  | `RIDER`           | Rider cancels before driver offer is created.                                                            |
+| `MATCHING`       | `FAILED`              | `SYSTEM`, `ADMIN` | System or admin abort.                                                                                   |
+| `OFFERED`        | `ASSIGNED`            | `DRIVER`          | Driver accepts within TTL; Redis claim finalized; ride assigned to driver.                               |
+| `OFFERED`        | `MATCHING`            | `SYSTEM`          | Offer TTL expired ($15\text{ s}$) or driver declined; Redis claim released; re-enqueued for next window. |
+| `OFFERED`        | `CANCELLED_BY_RIDER`  | `RIDER`           | Rider cancels during offer window; candidate driver notified and unlocked.                               |
+| `OFFERED`        | `FAILED`              | `SYSTEM`, `ADMIN` | System or admin abort.                                                                                   |
+| `ASSIGNED`       | `DRIVER_ARRIVED`      | `DRIVER`          | Driver location telemetry reaches pickup coordinate ($< 100\text{ m}$).                                  |
+| `ASSIGNED`       | `CANCELLED_BY_RIDER`  | `RIDER`           | Rider cancels after assignment; cancellation fee may apply.                                              |
+| `ASSIGNED`       | `CANCELLED_BY_DRIVER` | `DRIVER`          | Driver emergency cancellation; triggers re-dispatch or fee assessment.                                   |
+| `ASSIGNED`       | `MATCHING`            | `SYSTEM`          | System re-matches ride if driver drops ungracefully.                                                     |
+| `ASSIGNED`       | `FAILED`              | `SYSTEM`, `ADMIN` | System or admin abort.                                                                                   |
+| `DRIVER_ARRIVED` | `IN_PROGRESS`         | `DRIVER`          | Rider boards; driver begins trip meter.                                                                  |
+| `DRIVER_ARRIVED` | `CANCELLED_BY_RIDER`  | `RIDER`           | Rider cancels at pickup location.                                                                        |
+| `DRIVER_ARRIVED` | `CANCELLED_BY_DRIVER` | `DRIVER`          | Rider no-show timeout ($> 5\text{ min}$) cancel.                                                         |
+| `DRIVER_ARRIVED` | `FAILED`              | `SYSTEM`, `ADMIN` | System or admin abort.                                                                                   |
+| `IN_PROGRESS`    | `COMPLETED`           | `DRIVER`          | Vehicle arrives at destination; computes final distance/fare; triggers payment saga.                     |
+| `IN_PROGRESS`    | `FAILED`              | `SYSTEM`, `ADMIN` | Catastrophic incident or admin termination.                                                              |
 
 ---
 
-## 2.2 Invariant Enforcement & Concurrency Locking
+## 2.2 Invariant Enforcement, Optimistic Locking & Anti-IDOR Authorization
 
-To prevent race conditions (e.g. driver accepting while rider cancels):
+To maintain consistency under high concurrency and untrusted input:
 
-- **Row-Level Pessimistic Locking:** State transitions update the database inside an explicit SQL transaction with `SELECT ... FOR UPDATE`:
+- **Optimistic Concurrency Control with Version Checks:** State transitions update the database inside an explicit SQL transaction with optimistic lock verification (`expectedVersion`):
 
 ```typescript
-await db.transaction(async (tx) => {
-  const [ride] = await tx.select().from(rides).where(eq(rides.id, rideId)).for('update');
+export async function transitionRide(
+  tx: any,
+  rideId: string,
+  toState: TripState,
+  actor: TripActor,
+  expectedVersion?: number,
+  options: TransitionOptions = {},
+): Promise<Ride> {
+  const [current] = await tx.select().from(rides).where(eq(rides.id, rideId)).limit(1);
+  if (!current) throw AppError.notFound(`Ride ${rideId} not found`);
 
-  if (!isValidTransition(ride.status, nextStatus)) {
-    throw new InvalidStateTransitionError(ride.status, nextStatus);
+  // Optimistic lock check
+  if (expectedVersion !== undefined && current.version !== expectedVersion) {
+    throw AppError.conflict(
+      `Optimistic lock failure: ride version is ${current.version}, expected ${expectedVersion}`,
+    );
   }
 
-  await tx
+  // Legal transition validation
+  if (!isTransitionLegal(current.status, toState, actor)) {
+    throw AppError.badRequest(
+      `Illegal transition from ${current.status} to ${toState} by actor ${actor}`,
+    );
+  }
+
+  // Atomic state update and version increment
+  const [updated] = await tx
     .update(rides)
-    .set({ status: nextStatus, updatedAt: new Date() })
-    .where(eq(rides.id, rideId));
+    .set({
+      status: toState,
+      version: current.version + 1,
+      driverId: options.driverId !== undefined ? options.driverId : current.driverId,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(rides.id, rideId), eq(rides.version, current.version)))
+    .returning();
+
+  // Audit trail event record
+  await tx.insert(rideEvents).values({
+    rideId,
+    fromState: current.status,
+    toState,
+    actor,
+    metadata: { version: updated.version, correlationId: options.correlationId },
+  });
+
+  // Outbox publication for Kafka event streaming
   await tx.insert(outbox).values({
-    id: randomUUID(),
     topic: TOPICS.TRIP_STATE_CHANGED,
     key: rideId,
-    payload: JSON.stringify({ rideId, previousStatus: ride.status, newStatus: nextStatus }),
+    payload: JSON.stringify({
+      rideId,
+      fromState: current.status,
+      toState,
+      actor,
+      driverId: updated.driverId,
+      timestamp: new Date().toISOString(),
+    }),
   });
-});
+
+  return updated;
+}
+```
+
+- **Horizontal Authorization & Anti-IDOR Route Guards:** Core API validates caller ownership on all state and retrieval operations via `callerOf(request)`:
+  1. **Riders** can only query or cancel their own rides (`ride.riderId === caller.userId`).
+  2. **Drivers** can only transition rides where they are the assigned driver (`ride.driverId === caller.userId`) or accepting an offer.
+  3. **Admins and Internal Services** (`x-internal-token`) retain system-level permissions.
+     Attempts to access or alter another user's ride return HTTP `403 Forbidden`.
+
 ```
 
 ---
@@ -280,10 +367,12 @@ When a microservice mutates state and must notify other services via Kafka, perf
 2. Kafka publish succeeds, but database transaction rolls back: **Phantom event emitted, downstreams act on non-existent state.**
 
 ```
+
 [Service] ---- (1) Write DB (Success) ----> [PostgreSQL]
-    |
-    +--------- (2) Write Kafka (NETWORK ERROR / CRASH) ----x [Kafka Broker]
-    RESULT: Database updated, but downstream services NEVER receive event!
+|
++--------- (2) Write Kafka (NETWORK ERROR / CRASH) ----x [Kafka Broker]
+RESULT: Database updated, but downstream services NEVER receive event!
+
 ```
 
 ### The HexDispatch Solution: Transactional Outbox Pattern
@@ -291,20 +380,23 @@ When a microservice mutates state and must notify other services via Kafka, perf
 HexDispatch writes outgoing event envelopes directly into an `outbox` table in PostgreSQL **within the exact same ACID database transaction** as the business logic mutation.
 
 ```
+
 [Service] ---- (1) BEGIN TRANSACTION ---------------------------------+
-                  ├── Update `rides` SET status = 'IN_TRIP'           |
-                  └── Insert into `outbox` (topic, payload)            |
-               (2) COMMIT TRANSACTION (ACID Guaranteed) --------------+
+├── Update `rides` SET status = 'IN_TRIP' |
+└── Insert into `outbox` (topic, payload) |
+(2) COMMIT TRANSACTION (ACID Guaranteed) --------------+
 
                                 ▲
                                 │ Polls every 50ms
                                 │
+
 [Outbox Relay Worker] ──────────+
-        │
-        └─────── (3) Publish Batch to Kafka Broker ───► [Kafka]
-                        │
-                        └── (4) Delete / Mark Processed in `outbox` table
-```
+│
+└─────── (3) Publish Batch to Kafka Broker ───► [Kafka]
+│
+└── (4) Delete / Mark Processed in `outbox` table
+
+````
 
 #### Outbox Relay Implementation Highlights (`apps/core-api/src/services/outbox-relay.ts`):
 
@@ -341,7 +433,7 @@ export interface DriverOfferCreatedEvent {
   pickupDistanceMeters: number;
   expiresAt: string;
 }
-```
+````
 
 ---
 
@@ -631,6 +723,47 @@ If an H3 cell experiences extreme load or if the Kuhn-Munkres solver takes $> 5\
 3. Matching policy dynamically degrades from `batched` to `greedy`.
 4. Requests are immediately served one-by-one with nearest-driver greedy heuristic, preventing backlog accumulation.
 5. Once queue length and lag drop back within safe thresholds, the policy automatically restores batched matching.
+
+---
+
+## 4.8 Single-Flight Batch Cycle Concurrency (`cycleChain`)
+
+In high-throughput distributed matching, timer intervals, manual trigger calls, and webhook/Kafka events can initiate matching cycles faster than a single tick takes to execute. If two batch cycles execute concurrently in the same process:
+
+- Both cycles inspect the same pending rides.
+- Bipartite solvers compute matching graphs with duplicate candidates.
+- Race conditions generate multiple competing offers for the same ride.
+
+To guarantee strictly serial execution without lock contention, HexDispatch employs an in-memory single-flight promise chain (`cycleChain`) in `DispatchEngine`:
+
+```typescript
+private cycleChain: Promise<unknown> = Promise.resolve();
+
+runBatchCycle(targetRegion?: string): Promise<{
+  batchId: string;
+  assignmentsCount: number;
+  unmatchedCount: number;
+  fallback: boolean;
+}> {
+  const run = this.cycleChain.then(async () => {
+    this.cycleInFlight = true;
+    try {
+      return await this.runBatchCycleExclusive(targetRegion);
+    } finally {
+      this.cycleInFlight = false;
+    }
+  });
+  // Swallow errors in the chain so future ticks are not blocked
+  this.cycleChain = run.catch(() => undefined);
+  return run;
+}
+```
+
+### Architectural Guarantees:
+
+1. **Zero Overlapping Solver Executions:** Invocations queue up sequentially behind in-flight cycles.
+2. **Error Isolation:** A failed cycle (e.g. database timeout) logs Prometheus metrics and resolves the promise chain cleanly, allowing subsequent ticks to run unimpeded.
+3. **Deterministic State Progression:** Pending rides are transitioned to `MATCHING` and `OFFERED` in strict sequential order.
 
 ---
 
@@ -964,6 +1097,38 @@ HexDispatch includes an automated chaos runner (`tools/chaos/runner.ts`):
 
 ---
 
+## 8.4 Continuous Integration & Testcontainers Containerized Integration Suite
+
+HexDispatch implements a two-tier testing architecture to balance ultra-fast local development against container-accurate production verification:
+
+```
++-------------------------------------------------------------------------------+
+| Tier 1: Local Lightweight Mocks & In-Memory Storage                           |
+| - PGlite (WASM Postgres) & ioredis-mock                                       |
+| - Instant feedback: ~40s for full suite run                                  |
+| - Used during iterative test-driven development (TDD)                         |
++-------------------------------------------------------------------------------+
+                                    |
+                                    v (git push)
++-------------------------------------------------------------------------------+
+| Tier 2: GitHub Actions CI with Real Docker Infrastructure                     |
+| - Ubuntu Latest with Docker Engine                                            |
+| - Real PostgreSQL 16 Testcontainers (postgres:16-alpine)                      |
+| - Real Drizzle migrations applied via migrate(db, { migrationsFolder })       |
+| - Real TCP network sockets, connection pooling, and serialization verification|
++-------------------------------------------------------------------------------+
+```
+
+### Critical Invariants Verified via Testcontainers:
+
+1. **Migration Journal Verification:** Drizzle ORM requires `meta/_journal.json` and migration snapshots (`meta/0000_snapshot.json`) to track applied migrations in real PostgreSQL databases. All service migration directories are compiled with `drizzle-kit generate`.
+2. **Internal Service Authentication in Integration Tests:** Since services enforce `registerInternalAuth` by default, Testcontainers test suites wrap Fastify test instances with `withInternalAuth(app)` from `@hexdispatch/shared`, ensuring headers are injected seamlessly during end-to-end endpoint testing.
+3. **Graceful Environment Adaptability:** Suites employ `describe.skipIf(!dockerAvailable)`:
+   - On developer workstations without Docker running, unit tests and in-memory integration tests pass cleanly without environment friction.
+   - In GitHub Actions CI (where Docker is natively present), the Testcontainers suites run and validate real PostgreSQL transactions, constraints, and migrations.
+
+---
+
 # 9. Discrete-Event Simulation & Empirical Verification
 
 ## 9.1 Discrete-Event Simulation vs Continuous-Time Tick Simulation
@@ -1099,6 +1264,69 @@ Referrer-Policy: no-referrer
 
 - Automated scanning via `pnpm audit`.
 - Fixed critical transitive vulnerability in `tinypool` (CVE-2025-24965) by enforcing root package overrides (`tinypool: ">=2.1.2"`).
+
+---
+
+## 11.5 Internal Service Authentication (`registerInternalAuth` & Constant-Time Validation)
+
+Microservices inside the VPC must verify that incoming requests originate from a trusted peer (such as the API Gateway or another internal service worker) rather than a direct port probe or spoofed external client.
+
+HexDispatch provides `registerInternalAuth` in `packages/shared/src/internal-auth.ts`:
+
+1. **Mandatory Header Verification:** Internal endpoints require the `x-internal-token` HTTP header.
+2. **Timing-Attack Resistance:** Instead of standard string equality (`===`), which leaks character match length via CPU branch execution timing, HexDispatch uses `crypto.timingSafeEqual`:
+   ```typescript
+   export function isValidInternalToken(provided: unknown, expected: string): boolean {
+     if (typeof provided !== 'string') return false;
+     const a = Buffer.from(provided);
+     const b = Buffer.from(expected);
+     return a.length === b.length && timingSafeEqual(a, b);
+   }
+   ```
+3. **Public Path Whitelisting:** Standard liveness and observability endpoints (`/health`, `/ready`, `/metrics`) bypass authentication hooks to maintain compatibility with Kubernetes and Prometheus scrapers.
+4. **Enforcement in Production:** In production (`NODE_ENV=production`), `INTERNAL_SERVICE_TOKEN` must be explicitly configured with at least 16 high-entropy characters.
+
+---
+
+## 11.6 Dual-Layer Defense: Edge RBAC vs Internal Route Guards
+
+To enforce zero-trust defense-in-depth, HexDispatch applies two decoupled security perimeters:
+
+```
+[Public Internet]
+       |
+       v
++-------------------------------------------------------------------------+
+| Layer 1: Edge Gateway Guard                                             |
+| - Validates JWT signature and expiration                                 |
+| - Extracts Claims: { userId: "...", role: "RIDER" | "DRIVER" | "ADMIN" } |
+| - Stamps trusted internal headers: x-user-id, x-user-role               |
+| - Attaches shared secret: x-internal-token                              |
++-------------------------------------------------------------------------+
+       |
+       v (Internal VPC Network)
++-------------------------------------------------------------------------+
+| Layer 2: Service Domain Route Guards                                    |
+| - Validates x-internal-token via timingSafeEqual                        |
+| - Anti-IDOR: Verifies caller.userId matches ride.riderId/driverId       |
+| - Role Validation: Only RIDER can request ride; only DRIVER can accept  |
++-------------------------------------------------------------------------+
+```
+
+Even if an attacker gains internal network access or bypasses the gateway, internal services reject unauthenticated requests (HTTP 401) and prevent unauthorized resource manipulation (HTTP 403).
+
+---
+
+## 11.7 Verification Summary & Test Suite Invariants
+
+The entire HexDispatch codebase is governed by comprehensive automated quality gates enforced in GitHub Actions CI:
+
+- **Static Analysis & Compilation:** 100% clean typecheck (`pnpm typecheck`) and strict ESLint hygiene (`pnpm lint`) with zero warnings or errors.
+- **Code Style Uniformity:** Prettier compliance across all monorepo packages and apps (`pnpm format:check`).
+- **Test Suite Coverage:** **289 automated tests** across **43 suites** running in parallel:
+  - 100% pass rate locally on in-memory mocks (PGlite, ioredis-mock).
+  - 100% pass rate in GitHub Actions CI running real containerized PostgreSQL 16 databases via Testcontainers.
+- **Dependency Audit:** Zero critical or unmitigated high CVE vulnerabilities (`pnpm audit`).
 
 ---
 

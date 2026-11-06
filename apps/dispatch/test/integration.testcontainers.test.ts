@@ -3,6 +3,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import { runMigrations } from '../src/db/migrate';
 import { getDispatchDb } from '../src/db/index';
 import { buildDispatchApp } from '../src/app';
+import { withInternalAuth } from '@hexdispatch/shared';
 import { DriverClaimService } from '../src/services/driver-claim';
 import { MatchingRegistry } from '../src/services/matching-registry';
 import { OfferManager } from '../src/services/offer-manager';
@@ -58,11 +59,13 @@ describe.skipIf(!dockerAvailable)('Dispatch Testcontainers Integration (PostgreS
       claimService,
     });
 
-    app = await buildDispatchApp({
-      offerManager,
-      dispatchEngine,
-      logLevel: 'silent',
-    });
+    app = withInternalAuth(
+      await buildDispatchApp({
+        offerManager,
+        dispatchEngine,
+        logLevel: 'silent',
+      }),
+    );
     await app.ready();
   }, 60000);
 

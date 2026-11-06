@@ -3,6 +3,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import { runMigrations } from '../src/db/migrate';
 import { getCoreDb } from '../src/db/index';
 import { buildCoreApiApp } from '../src/app';
+import { withInternalAuth } from '@hexdispatch/shared';
 import { users, rides } from '../src/db/schema';
 import { eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
@@ -39,7 +40,7 @@ describe.skipIf(!dockerAvailable)('Core API Testcontainers Integration (PostgreS
     await runMigrations(connectionUri);
 
     dbConnection = getCoreDb(connectionUri);
-    app = await buildCoreApiApp({ db: dbConnection.db, logLevel: 'silent' });
+    app = withInternalAuth(await buildCoreApiApp({ db: dbConnection.db, logLevel: 'silent' }));
     await app.ready();
   }, 60000);
 

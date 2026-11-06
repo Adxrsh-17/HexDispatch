@@ -3,6 +3,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import { runMigrations } from '../src/db/migrate';
 import { getPaymentDb } from '../src/db/index';
 import { buildPaymentApp } from '../src/app';
+import { withInternalAuth } from '@hexdispatch/shared';
 import { DoubleEntryLedger, assertLedgerInvariant } from '../src/ledger/double-entry';
 import { MockPspClient } from '../src/psp/mock-psp';
 import { PaymentSagaService } from '../src/services/payment-saga';
@@ -49,14 +50,16 @@ describe.skipIf(!dockerAvailable)('Payment Testcontainers Integration (PostgreSQ
     });
     const reconciliationService = new ReconciliationService(dbConnection.db);
 
-    app = await buildPaymentApp({
-      db: dbConnection.db,
-      pspClient,
-      sagaService,
-      reconciliationService,
-      ledger,
-      logLevel: 'silent',
-    });
+    app = withInternalAuth(
+      await buildPaymentApp({
+        db: dbConnection.db,
+        pspClient,
+        sagaService,
+        reconciliationService,
+        ledger,
+        logLevel: 'silent',
+      }),
+    );
   }, 60000);
 
   afterAll(async () => {

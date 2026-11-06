@@ -10,12 +10,18 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export async function createTestDb() {
   const client = new PGlite();
 
-  const sqlPath = path.resolve(__dirname, '../drizzle/migrations/0000_freezing_leader.sql');
-  const migrationSql = fs.readFileSync(sqlPath, 'utf-8');
+  const migrationsDir = path.resolve(__dirname, '../drizzle/migrations');
+  const sqlFiles = fs
+    .readdirSync(migrationsDir)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
 
-  // Remove drizzle statement-breakpoints and execute on PGlite
-  const cleanSql = migrationSql.replace(/--> statement-breakpoint/g, ';');
-  await client.exec(cleanSql);
+  for (const file of sqlFiles) {
+    const migrationSql = fs.readFileSync(path.join(migrationsDir, file), 'utf-8');
+    // Remove drizzle statement-breakpoints and execute on PGlite
+    const cleanSql = migrationSql.replace(/--> statement-breakpoint/g, ';');
+    await client.exec(cleanSql);
+  }
 
   const db = drizzle(client, { schema });
 

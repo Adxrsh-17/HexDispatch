@@ -3,6 +3,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import { runMigrations } from '../src/db/migrate';
 import { getPricingDb } from '../src/db/index';
 import { buildPricingApp } from '../src/app';
+import { withInternalAuth } from '@hexdispatch/shared';
 import { PricingService } from '../src/services/pricing-service';
 import { quotes } from '../src/db/schema';
 import RedisMock from 'ioredis-mock';
@@ -45,10 +46,12 @@ describe.skipIf(!dockerAvailable)('Pricing Testcontainers Integration (PostgreSQ
       redis,
     });
 
-    app = await buildPricingApp({
-      pricingService,
-      logLevel: 'silent',
-    });
+    app = withInternalAuth(
+      await buildPricingApp({
+        pricingService,
+        logLevel: 'silent',
+      }),
+    );
     await app.ready();
   }, 60000);
 

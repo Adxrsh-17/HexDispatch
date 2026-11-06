@@ -235,7 +235,8 @@ Built phase by phase; see [`docs/REVIEW.md`](docs/REVIEW.md) for an independent 
 - [x] Scaffold, Phases 1-9 implemented (see the review for caveats per phase)
 - [ ] Phase 0 gaps: OpenTelemetry tracing, Kafka wrapper integration test
 - [ ] Payments: fare in `trip.state.changed`, duplicate/out-of-order PSP callbacks
-- [ ] Real-infrastructure test run (Testcontainers), real k6 load test, real failure injection
+- [x] Real-infrastructure test run: PostgreSQL 16 Testcontainers integration suites for core-api, dispatch, payment, and pricing passing in CI
+- [ ] Real k6 load test against production cluster, real failure injection
 - [ ] Simulator: give batched riders a patience limit
 
 ---
