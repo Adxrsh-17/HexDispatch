@@ -6,7 +6,7 @@ import {
   validatorCompiler,
   jsonSchemaTransform,
 } from 'fastify-type-provider-zod';
-import { buildServer } from '@hexdispatch/shared';
+import { buildServer, registerInternalAuth, assertJwtSecretConfigured } from '@hexdispatch/shared';
 import { authRoutes } from './routes/auth';
 import { rideRoutes } from './routes/rides';
 
@@ -18,6 +18,7 @@ export interface CoreApiOptions {
 
 export async function buildCoreApiApp(options: CoreApiOptions): Promise<FastifyInstance> {
   const { db, logLevel } = options;
+  assertJwtSecretConfigured();
 
   const app = buildServer({
     service: 'core-api',
@@ -28,6 +29,10 @@ export async function buildCoreApiApp(options: CoreApiOptions): Promise<FastifyI
       },
     },
   });
+
+  // Only the gateway and internal services may call core-api; x-user-* headers are trusted
+  // solely because of this check.
+  registerInternalAuth(app, { publicPrefixes: ['/docs'] });
 
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);

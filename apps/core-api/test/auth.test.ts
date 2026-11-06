@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { withInternalAuth } from '@hexdispatch/shared';
 import { createTestDb } from './test-db';
 import { buildCoreApiApp } from '../src/app';
 import type { FastifyInstance } from 'fastify';
@@ -15,7 +16,7 @@ describe('Auth & Driver Routes', () => {
     db = testDb.db;
     client = testDb.client;
 
-    app = await buildCoreApiApp({ db, logLevel: 'silent' });
+    app = withInternalAuth(await buildCoreApiApp({ db, logLevel: 'silent' }));
     await app.ready();
   });
 

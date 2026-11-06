@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { withInternalAuth } from '@hexdispatch/shared';
 import { randomUUID } from 'node:crypto';
 import RedisMock from 'ioredis-mock';
 import type { FastifyInstance } from 'fastify';
@@ -35,10 +36,12 @@ describe('Pricing Service & REST API (AC1 & AC4)', () => {
       producer: mockProducer,
     });
 
-    app = await buildPricingApp({
-      pricingService,
-      logLevel: 'silent',
-    });
+    app = withInternalAuth(
+      await buildPricingApp({
+        pricingService,
+        logLevel: 'silent',
+      }),
+    );
     await app.ready();
   });
 

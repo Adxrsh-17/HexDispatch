@@ -193,8 +193,13 @@ describe('Offers, Declines, Timeouts & Re-offer Lifecycle (AC3)', () => {
     expect(initialOffers).toHaveLength(1);
     expect(initialOffers[0]!.driverId).toBe(driver1Id);
 
-    // Wait 250ms for timeout to fire and re-offer to complete
-    await new Promise((r) => setTimeout(r, 250));
+    // Wait for timeout to fire and re-offer to complete (poll up to 1500ms)
+    let allRideOffers = await dbResult.db.select().from(offers).where(eq(offers.rideId, rideId));
+    const startWait = Date.now();
+    while (allRideOffers.length < 2 && Date.now() - startWait < 1500) {
+      await new Promise((r) => setTimeout(r, 50));
+      allRideOffers = await dbResult.db.select().from(offers).where(eq(offers.rideId, rideId));
+    }
 
     // Offer 1 must be EXPIRED
     const expiredOffer = await offerManager.getOfferById(initialOffers[0]!.id);
@@ -204,7 +209,6 @@ describe('Offers, Declines, Timeouts & Re-offer Lifecycle (AC3)', () => {
     expect(await claimService.getClaim(driver1Id)).toBeNull();
 
     // Re-offer must have been created for Driver 2
-    const allRideOffers = await dbResult.db.select().from(offers).where(eq(offers.rideId, rideId));
     expect(allRideOffers.length).toBeGreaterThanOrEqual(2);
     expect(allRideOffers.some((o) => o.driverId === driver2Id)).toBe(true);
   });

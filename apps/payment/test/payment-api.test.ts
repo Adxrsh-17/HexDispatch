@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { withInternalAuth } from '@hexdispatch/shared';
 import type { FastifyInstance } from 'fastify';
 import { createTestDb } from './test-db';
 import { DoubleEntryLedger, assertLedgerInvariant } from '../src/ledger/double-entry';
@@ -28,14 +29,16 @@ describe('Payment Service REST API', () => {
     });
     reconciler = new ReconciliationService(dbResult.db);
 
-    app = await buildPaymentApp({
-      db: dbResult.db,
-      pspClient,
-      sagaService,
-      reconciliationService: reconciler,
-      ledger,
-      logLevel: 'silent',
-    });
+    app = withInternalAuth(
+      await buildPaymentApp({
+        db: dbResult.db,
+        pspClient,
+        sagaService,
+        reconciliationService: reconciler,
+        ledger,
+        logLevel: 'silent',
+      }),
+    );
   });
 
   afterEach(async () => {

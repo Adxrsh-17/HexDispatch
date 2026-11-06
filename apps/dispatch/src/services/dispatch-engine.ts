@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import { latLngToCell } from 'h3-js';
 import { Counter, Histogram, type Registry } from 'prom-client';
@@ -11,14 +11,20 @@ import {
   type DriverCandidate,
   type RideRequest,
   type MatchContext,
+  type MatchResult,
+  type MatchingPolicy,
   GreedyPolicy,
   DEFAULT_MATCHING_CONFIG,
 } from '@hexdispatch/matching';
-import { processedEvents } from '../db/schema';
+import { AppError, createLogger, internalFetch } from '@hexdispatch/shared';
+import { processedEvents, offers } from '../db/schema';
 import type { OfferManager } from './offer-manager';
 import type { MatchingRegistry } from './matching-registry';
 import type { DriverClaimService } from './driver-claim';
+import { RideStateError, requestTransition } from './core-client';
 import type Redis from 'ioredis';
+
+const logger = createLogger({ service: 'dispatch-engine' });
 
 export interface DispatchEngineOptions {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle db
@@ -34,6 +40,12 @@ export interface DispatchEngineOptions {
   maxOfferAttempts?: number;
   batchWindowMs?: number;
   batchLagFallbackMs?: number;
+  /** A batched ride that finds no driver within this time becomes NO_DRIVER_FOUND. Default 60 s. */
+  matchingTimeoutMs?: number;
+  /** If one solve takes longer than this, later windows use greedy for a cooldown. Default 1500 ms. */
+  batchSolveBudgetMs?: number;
+  /** How long to stay on greedy after a slow or failed solve. Default 10 s. */
+  degradeCooldownMs?: number;
   h3MatcherOwnerRes?: number;
   metricsRegistry?: Registry;
   producer?: {
@@ -52,6 +64,20 @@ export interface ActiveRideState {
   excludedDriverIds: Set<string>;
 }
 
+/** Subset of the core-api ride row that dispatch needs to rebuild its in-memory state. */
+interface CoreRideRow {
+  id: string;
+  riderId: string;
+  status: string;
+  pickupLat: number;
+  pickupLng: number;
+  dropoffLat: number;
+  dropoffLng: number;
+  createdAt: string;
+}
+
+const DISPATCHABLE_STATUSES = new Set(['REQUESTED', 'MATCHING', 'OFFERED']);
+
 export class DispatchEngine {
   private activeRides = new Map<string, ActiveRideState>();
   private regionPendingRides = new Map<string, Set<string>>();
@@ -59,12 +85,21 @@ export class DispatchEngine {
   private maxAttempts: number;
   private batchWindowMs: number;
   private batchLagFallbackMs: number;
+  private matchingTimeoutMs: number;
+  private batchSolveBudgetMs: number;
+  private degradeCooldownMs: number;
   private h3MatcherOwnerRes: number;
   private batchTimer?: NodeJS.Timeout;
   private lastBatchRunMs = Date.now();
   private forceFallback = false;
+  private degradedUntilMs = 0;
+  /** Batch cycles run strictly one at a time; overlapping cycles would double-offer a ride. */
+  private cycleChain: Promise<unknown> = Promise.resolve();
+  private cycleInFlight = false;
 
   readonly fallbackCounter: Counter<string>;
+  readonly batchErrorCounter: Counter<string>;
+  readonly skippedWindowCounter: Counter<string>;
   readonly batchDurationHistogram: Histogram<string>;
 
   constructor(private options: DispatchEngineOptions) {
@@ -72,19 +107,33 @@ export class DispatchEngine {
     this.maxAttempts = options.maxOfferAttempts ?? 3;
     this.batchWindowMs = options.batchWindowMs ?? 2000;
     this.batchLagFallbackMs = options.batchLagFallbackMs ?? 5000;
+    this.matchingTimeoutMs = options.matchingTimeoutMs ?? 60_000;
+    this.batchSolveBudgetMs = options.batchSolveBudgetMs ?? 1500;
+    this.degradeCooldownMs = options.degradeCooldownMs ?? 10_000;
     this.h3MatcherOwnerRes = options.h3MatcherOwnerRes ?? 6;
 
     const registry = options.metricsRegistry;
+    const registers = registry ? [registry] : [];
     this.fallbackCounter = new Counter({
       name: 'dispatch_fallback_total',
       help: 'Total number of batch matching fallbacks to greedy',
-      registers: registry ? [registry] : [],
+      registers,
+    });
+    this.batchErrorCounter = new Counter({
+      name: 'dispatch_batch_errors_total',
+      help: 'Batch solves that threw and were replaced by greedy',
+      registers,
+    });
+    this.skippedWindowCounter = new Counter({
+      name: 'dispatch_batch_skipped_windows_total',
+      help: 'Timer ticks skipped because the previous batch cycle was still running',
+      registers,
     });
     this.batchDurationHistogram = new Histogram({
       name: 'dispatch_batch_duration_seconds',
       help: 'Duration of batch matching cycles in seconds',
       buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
-      registers: registry ? [registry] : [],
+      registers,
     });
 
     if (this.policyName === 'batched' && this.batchWindowMs > 0) {
@@ -95,8 +144,12 @@ export class DispatchEngine {
   startBatchTimer(): void {
     if (this.batchTimer) return;
     this.batchTimer = setInterval(() => {
-      this.runBatchCycle().catch((err) => {
-        console.error('Error during scheduled batch matching cycle:', err);
+      if (this.cycleInFlight) {
+        this.skippedWindowCounter.inc();
+        return;
+      }
+      this.runBatchCycle().catch((err: unknown) => {
+        logger.error({ err }, 'scheduled batch matching cycle failed');
       });
     }, this.batchWindowMs);
   }
@@ -142,6 +195,22 @@ export class DispatchEngine {
     this.activeRides.set(state.rideId, state);
   }
 
+  /** Stop working on a ride (cancelled, terminal, or handed to a driver). */
+  dropRide(rideId: string): void {
+    this.activeRides.delete(rideId);
+    for (const set of this.regionPendingRides.values()) set.delete(rideId);
+  }
+
+  private enqueueForBatch(ride: ActiveRideState): void {
+    const region = this.getRegionForPoint(ride.pickup);
+    let set = this.regionPendingRides.get(region);
+    if (!set) {
+      set = new Set<string>();
+      this.regionPendingRides.set(region, set);
+    }
+    set.add(ride.rideId);
+  }
+
   async handleRideRequested(event: RideRequestedEvent): Promise<void> {
     const { eventId, payload } = event;
 
@@ -179,16 +248,23 @@ export class DispatchEngine {
     };
     this.activeRides.set(payload.rideId, rideState);
 
-    // 3. Move ride to MATCHING in core-api
+    // 3. Move ride to MATCHING in core-api. If core refuses, the ride is not ours to dispatch.
     if (this.options.coreApiUrl) {
       try {
-        await fetch(`${this.options.coreApiUrl}/rides/${payload.rideId}/transition`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ to: 'MATCHING', actor: 'SYSTEM' }),
+        await requestTransition(this.options.coreApiUrl, payload.rideId, {
+          to: 'MATCHING',
+          actor: 'SYSTEM',
         });
       } catch (err) {
-        console.error(`Failed to move ride ${payload.rideId} to MATCHING:`, err);
+        if (err instanceof RideStateError) {
+          // e.g. rider cancelled before dispatch picked it up
+          this.dropRide(payload.rideId);
+          logger.warn({ err: err.message }, 'ride not dispatchable; dropped');
+          return;
+        }
+        // Transient: keep the ride; startup/periodic recovery re-reads MATCHING rides from core.
+        logger.error({ err, rideId: payload.rideId }, 'could not move ride to MATCHING');
+        return;
       }
     }
 
@@ -196,45 +272,106 @@ export class DispatchEngine {
     if (this.policyName === 'greedy') {
       await this.dispatchRide(payload.rideId);
     } else {
-      // In batched mode: add to region pending queue
-      const region = this.getRegionForPoint(payload.pickup);
-      let set = this.regionPendingRides.get(region);
-      if (!set) {
-        set = new Set<string>();
-        this.regionPendingRides.set(region, set);
-      }
-      set.add(payload.rideId);
+      this.enqueueForBatch(rideState);
     }
   }
 
-  async dispatchRide(rideId: string): Promise<boolean> {
-    let ride = this.activeRides.get(rideId);
-    if (!ride) {
-      // Try to construct minimal ride state from core-api if available
-      if (this.options.coreApiUrl) {
-        try {
-          const res = await fetch(`${this.options.coreApiUrl}/rides/${rideId}`);
-          if (res.ok) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Ride row
-            const data = (await res.json()) as any;
-            ride = {
-              rideId: data.id,
-              riderId: data.riderId,
-              pickup: data.pickup ?? { lat: data.pickupLat, lng: data.pickupLng },
-              dropoff: data.dropoff ?? { lat: data.dropoffLat, lng: data.dropoffLng },
-              vehicleType: data.vehicleType,
-              requestedAtMs: new Date(data.createdAt).getTime(),
-              attempts: 0,
-              excludedDriverIds: new Set<string>(),
-            };
-            this.activeRides.set(rideId, ride);
-          }
-        } catch {
-          // ignore
-        }
-      }
+  /**
+   * Rebuild in-memory ride state from the durable sources (core-api ride row + offers table).
+   * Returns undefined if the ride is gone or no longer dispatchable.
+   */
+  private async hydrateRide(row: CoreRideRow): Promise<ActiveRideState | undefined> {
+    if (!DISPATCHABLE_STATUSES.has(row.status)) return undefined;
+
+    const priorOffers = await this.options.db
+      .select()
+      .from(offers)
+      .where(eq(offers.rideId, row.id));
+
+    const excluded = new Set<string>();
+    for (const o of priorOffers as Array<{ status: string; driverId: string }>) {
+      if (o.status !== 'PENDING') excluded.add(o.driverId);
     }
 
+    const state: ActiveRideState = {
+      rideId: row.id,
+      riderId: row.riderId,
+      pickup: { lat: row.pickupLat, lng: row.pickupLng },
+      dropoff: { lat: row.dropoffLat, lng: row.dropoffLng },
+      vehicleType: 'sedan',
+      requestedAtMs: new Date(row.createdAt).getTime(),
+      attempts: (priorOffers as unknown[]).length,
+      excludedDriverIds: excluded,
+    };
+    this.activeRides.set(row.id, state);
+    return state;
+  }
+
+  private async loadRide(rideId: string): Promise<ActiveRideState | undefined> {
+    const known = this.activeRides.get(rideId);
+    if (known) return known;
+    if (!this.options.coreApiUrl) return undefined;
+    try {
+      const res = await internalFetch(`${this.options.coreApiUrl}/rides/${rideId}`);
+      if (!res.ok) return undefined;
+      return await this.hydrateRide((await res.json()) as CoreRideRow);
+    } catch (err) {
+      logger.warn({ err, rideId }, 'could not load ride from core-api');
+      return undefined;
+    }
+  }
+
+  /**
+   * Startup recovery: pick up rides that core-api still has in REQUESTED/MATCHING but that this
+   * process knows nothing about (restart, crash). Without this they would wait forever.
+   */
+  async recoverPendingRides(): Promise<{ recovered: number }> {
+    if (!this.options.coreApiUrl) return { recovered: 0 };
+    let recovered = 0;
+    const pageSize = 100;
+
+    for (const status of ['REQUESTED', 'MATCHING'] as const) {
+      for (let offset = 0; ; offset += pageSize) {
+        const res = await internalFetch(
+          `${this.options.coreApiUrl}/rides?status=${status}&limit=${pageSize}&offset=${offset}`,
+        );
+        if (!res.ok) {
+          throw new Error(`core-api ride listing failed with HTTP ${res.status}`);
+        }
+        const page = (await res.json()) as CoreRideRow[];
+
+        for (const row of page) {
+          if (this.activeRides.has(row.id)) continue;
+          const state = await this.hydrateRide(row);
+          if (!state) continue;
+
+          if (status === 'REQUESTED') {
+            try {
+              await requestTransition(this.options.coreApiUrl, row.id, {
+                to: 'MATCHING',
+                actor: 'SYSTEM',
+              });
+            } catch (err) {
+              this.dropRide(row.id);
+              logger.warn({ err, rideId: row.id }, 'recovery: ride could not enter MATCHING');
+              continue;
+            }
+          }
+          recovered += 1;
+          if (this.policyName === 'greedy') {
+            await this.dispatchRide(row.id);
+          } else {
+            this.enqueueForBatch(state);
+          }
+        }
+        if (page.length < pageSize) break;
+      }
+    }
+    return { recovered };
+  }
+
+  async dispatchRide(rideId: string): Promise<boolean> {
+    const ride = await this.loadRide(rideId);
     if (!ride) {
       return false;
     }
@@ -286,29 +423,59 @@ export class DispatchEngine {
 
     // 4. Create offer for best match
     const assignment = result.assignments[0]!;
-    ride.attempts += 1;
-
-    const offer = await this.options.offerManager.createOffer({
-      rideId: ride.rideId,
-      driverId: assignment.driverId,
-      pickup: ride.pickup,
-      dropoff: ride.dropoff,
-      pickupEtaSec: assignment.pickupEtaSec,
-      cost: assignment.cost,
-      policy: this.policyName,
-    });
+    let offer;
+    try {
+      offer = await this.options.offerManager.createOffer({
+        rideId: ride.rideId,
+        driverId: assignment.driverId,
+        pickup: ride.pickup,
+        dropoff: ride.dropoff,
+        pickupEtaSec: assignment.pickupEtaSec,
+        cost: assignment.cost,
+        policy: this.policyName,
+      });
+    } catch (err) {
+      if (err instanceof RideStateError) {
+        this.dropRide(rideId);
+        return false;
+      }
+      logger.error({ err, rideId }, 'offer creation failed');
+      return false;
+    }
 
     if (!offer) {
-      // Race: driver was claimed concurrently between check and Lua claim.
-      // Exclude driver for this round and retry immediately.
+      // Race: driver was claimed concurrently between check and Lua claim. Try the next one.
       ride.excludedDriverIds.add(assignment.driverId);
       return this.dispatchRide(rideId);
     }
 
+    ride.attempts += 1;
     return true;
   }
 
-  async runBatchCycle(targetRegion?: string): Promise<{
+  /**
+   * One matching window. Calls are serialised: a second call waits for the first, so two windows
+   * can never offer the same ride at once.
+   */
+  runBatchCycle(targetRegion?: string): Promise<{
+    batchId: string;
+    assignmentsCount: number;
+    unmatchedCount: number;
+    fallback: boolean;
+  }> {
+    const run = this.cycleChain.then(async () => {
+      this.cycleInFlight = true;
+      try {
+        return await this.runBatchCycleExclusive(targetRegion);
+      } finally {
+        this.cycleInFlight = false;
+      }
+    });
+    this.cycleChain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async runBatchCycleExclusive(targetRegion?: string): Promise<{
     batchId: string;
     assignmentsCount: number;
     unmatchedCount: number;
@@ -327,9 +494,10 @@ export class DispatchEngine {
     let totalUnmatched = 0;
     let usedFallback = false;
 
-    // Check lag fallback
+    // Greedy is used when forced, when windows are running late, or during the cooldown that
+    // follows a slow or failed solve.
     const isLagFallback = lagMs > this.batchLagFallbackMs;
-    const shouldFallback = this.forceFallback || isLagFallback;
+    const shouldFallback = this.forceFallback || isLagFallback || startMs < this.degradedUntilMs;
 
     if (shouldFallback) {
       usedFallback = true;
@@ -349,9 +517,10 @@ export class DispatchEngine {
           pendingSet.delete(rideId);
           continue;
         }
-        if (ride.attempts >= this.maxAttempts) {
-          await this.handleNoDriverFound(rideId);
+        const waitedMs = startMs - ride.requestedAtMs;
+        if (ride.attempts >= this.maxAttempts || waitedMs > this.matchingTimeoutMs) {
           pendingSet.delete(rideId);
+          await this.handleNoDriverFound(rideId);
           totalUnmatched += 1;
         } else {
           eligibleRides.push(ride);
@@ -359,11 +528,6 @@ export class DispatchEngine {
       }
 
       if (eligibleRides.length === 0) continue;
-
-      // Choose policy (if fallback, use GreedyPolicy; else BatchedPolicy)
-      const policy = shouldFallback
-        ? new GreedyPolicy()
-        : this.options.matchingRegistry.get(this.policyName);
 
       // Collect drivers near pickups of eligible rides
       const driversMap = new Map<string, DriverCandidate>();
@@ -392,37 +556,70 @@ export class DispatchEngine {
         config: DEFAULT_MATCHING_CONFIG,
       };
 
-      const result = policy.match(requests, availableCandidates, ctx);
+      // Choose policy; a solver that throws or is too slow must never strand the batch.
+      const greedy = new GreedyPolicy();
+      let policy: MatchingPolicy = shouldFallback
+        ? greedy
+        : this.options.matchingRegistry.get(this.policyName);
+      let regionFellBack = shouldFallback;
+      let result: MatchResult;
+      const solveStart = Date.now();
+      try {
+        result = policy.match(requests, availableCandidates, ctx);
+      } catch (err) {
+        logger.error({ err, region, policy: policy.name }, 'batch solve failed; using greedy');
+        this.batchErrorCounter.inc();
+        if (!regionFellBack) this.fallbackCounter.inc();
+        usedFallback = true;
+        regionFellBack = true;
+        this.degradedUntilMs = Date.now() + this.degradeCooldownMs;
+        policy = greedy;
+        result = greedy.match(requests, availableCandidates, ctx);
+      }
+      const solveMs = Date.now() - solveStart;
+      if (!regionFellBack && solveMs > this.batchSolveBudgetMs) {
+        logger.warn({ region, solveMs }, 'batch solve exceeded budget; greedy for next windows');
+        this.degradedUntilMs = Date.now() + this.degradeCooldownMs;
+      }
 
       // Process assignments
       for (const assignment of result.assignments) {
         const ride = this.activeRides.get(assignment.rideId);
         if (!ride) continue;
 
-        ride.attempts += 1;
-        const offer = await this.options.offerManager.createOffer({
-          rideId: ride.rideId,
-          driverId: assignment.driverId,
-          pickup: ride.pickup,
-          dropoff: ride.dropoff,
-          pickupEtaSec: assignment.pickupEtaSec,
-          cost: assignment.cost,
-          policy: policy.name,
-          batchId,
-        });
+        try {
+          const offer = await this.options.offerManager.createOffer({
+            rideId: ride.rideId,
+            driverId: assignment.driverId,
+            pickup: ride.pickup,
+            dropoff: ride.dropoff,
+            pickupEtaSec: assignment.pickupEtaSec,
+            cost: assignment.cost,
+            policy: policy.name,
+            batchId,
+          });
 
-        if (offer) {
-          pendingSet.delete(ride.rideId);
-          totalAssignments += 1;
-        } else {
-          // Concurrent claim collision: exclude driver and leave ride in pendingSet
-          ride.excludedDriverIds.add(assignment.driverId);
+          if (offer) {
+            ride.attempts += 1;
+            pendingSet.delete(ride.rideId);
+            totalAssignments += 1;
+          } else {
+            // Concurrent claim collision: exclude driver, ride stays queued for the next window.
+            ride.excludedDriverIds.add(assignment.driverId);
+          }
+        } catch (err) {
+          if (err instanceof RideStateError) {
+            pendingSet.delete(ride.rideId); // cancelled or otherwise no longer dispatchable
+            this.dropRide(ride.rideId);
+          } else {
+            logger.error({ err, rideId: ride.rideId }, 'offer creation failed; will retry');
+          }
         }
       }
 
       totalUnmatched += result.unmatchedRideIds.length;
 
-      // Publish dispatch.batch.completed
+      // Publish dispatch.batch.completed (informational)
       const durationMs = Date.now() - startMs;
       const batchEvent: DispatchBatchCompletedEvent = {
         eventId: randomUUID(),
@@ -434,7 +631,7 @@ export class DispatchEngine {
           batchId,
           region,
           policy: policy.name,
-          fallback: shouldFallback,
+          fallback: regionFellBack,
           assignmentsCount: result.assignments.length,
           unmatchedCount: result.unmatchedRideIds.length,
           durationMs,
@@ -442,7 +639,11 @@ export class DispatchEngine {
       };
 
       if (this.options.producer) {
-        await this.options.producer.publish(TOPICS.DISPATCH_BATCH_COMPLETED, region, batchEvent);
+        try {
+          await this.options.producer.publish(TOPICS.DISPATCH_BATCH_COMPLETED, region, batchEvent);
+        } catch (err) {
+          logger.error({ err }, 'dispatch.batch.completed publish failed');
+        }
       }
       await this.notifyRealtime(`region:${region}`, 'DISPATCH_BATCH_COMPLETED', batchEvent.payload);
     }
@@ -459,37 +660,32 @@ export class DispatchEngine {
   }
 
   async handleReofferNeeded(rideId: string, excludedDriverId: string): Promise<void> {
-    const ride = this.activeRides.get(rideId);
-    if (ride) {
-      ride.excludedDriverIds.add(excludedDriverId);
-    }
+    // After a restart the in-memory state is gone: rebuild it from core-api + the offers table.
+    const ride = await this.loadRide(rideId);
+    if (!ride) return;
+    ride.excludedDriverIds.add(excludedDriverId);
+
     if (this.policyName === 'batched') {
-      if (ride) {
-        const region = this.getRegionForPoint(ride.pickup);
-        let set = this.regionPendingRides.get(region);
-        if (!set) {
-          set = new Set<string>();
-          this.regionPendingRides.set(region, set);
-        }
-        set.add(rideId);
-      }
+      this.enqueueForBatch(ride);
     } else {
       await this.dispatchRide(rideId);
     }
   }
 
   private async handleNoDriverFound(rideId: string): Promise<void> {
-    this.activeRides.delete(rideId);
+    this.dropRide(rideId);
 
     if (this.options.coreApiUrl) {
       try {
-        await fetch(`${this.options.coreApiUrl}/rides/${rideId}/transition`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ to: 'NO_DRIVER_FOUND', actor: 'SYSTEM' }),
+        await requestTransition(this.options.coreApiUrl, rideId, {
+          to: 'NO_DRIVER_FOUND',
+          actor: 'SYSTEM',
         });
       } catch (err) {
-        console.error(`Failed to move ride ${rideId} to NO_DRIVER_FOUND:`, err);
+        if (err instanceof RideStateError) {
+          return; // already cancelled/terminal: nothing to tell the rider
+        }
+        logger.error({ err, rideId }, 'could not move ride to NO_DRIVER_FOUND');
       }
     }
 
@@ -506,7 +702,7 @@ export class DispatchEngine {
 
     try {
       const url = `${this.options.locationUrl}/drivers/nearby?lat=${pickup.lat}&lng=${pickup.lng}&radiusKm=10&status=AVAILABLE&limit=50`;
-      const res = await fetch(url);
+      const res = await internalFetch(url);
       if (!res.ok) {
         return [];
       }
@@ -528,46 +724,65 @@ export class DispatchEngine {
     }
   }
 
-  // --- Drive Trip Endpoints (Task 5) ---
+  // --- Drive the trip ---
+
+  /** The driver acting on a ride must be the one whose offer was accepted. */
+  private async assertDriverAssigned(rideId: string, driverId: string): Promise<void> {
+    const rows = await this.options.db
+      .select()
+      .from(offers)
+      .where(
+        and(
+          eq(offers.rideId, rideId),
+          eq(offers.driverId, driverId),
+          eq(offers.status, 'ACCEPTED'),
+        ),
+      )
+      .limit(1);
+    if (rows.length === 0) {
+      throw AppError.forbidden('Driver is not assigned to this ride');
+    }
+  }
+
+  /** Move the ride in core-api; translate "the state machine said no" into a 409. */
+  private async driveRide(
+    rideId: string,
+    to: 'DRIVER_ARRIVED' | 'IN_PROGRESS' | 'COMPLETED',
+  ): Promise<void> {
+    if (!this.options.coreApiUrl) return;
+    try {
+      await requestTransition(this.options.coreApiUrl, rideId, { to, actor: 'DRIVER' });
+    } catch (err) {
+      if (err instanceof RideStateError) {
+        throw AppError.conflict(`Ride cannot move to ${to} from its current state`, {
+          detail: err.detail,
+        });
+      }
+      throw err;
+    }
+  }
 
   async driverArrived(rideId: string, driverId: string): Promise<void> {
-    if (this.options.coreApiUrl) {
-      await fetch(`${this.options.coreApiUrl}/rides/${rideId}/transition`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ to: 'DRIVER_ARRIVED', driverId, actor: 'DRIVER' }),
-      });
-    }
-
+    await this.assertDriverAssigned(rideId, driverId);
+    await this.driveRide(rideId, 'DRIVER_ARRIVED');
     await this.notifyRealtime(`ride:${rideId}`, 'DRIVER_ARRIVED', { rideId, driverId });
     await this.notifyRealtime(`driver:${driverId}`, 'DRIVER_ARRIVED', { rideId, driverId });
   }
 
   async startTrip(rideId: string, driverId: string): Promise<void> {
-    if (this.options.coreApiUrl) {
-      await fetch(`${this.options.coreApiUrl}/rides/${rideId}/transition`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ to: 'IN_TRIP', driverId, actor: 'DRIVER' }),
-      });
-    }
-
-    await this.notifyRealtime(`ride:${rideId}`, 'IN_TRIP', { rideId, driverId });
-    await this.notifyRealtime(`driver:${driverId}`, 'IN_TRIP', { rideId, driverId });
+    await this.assertDriverAssigned(rideId, driverId);
+    await this.driveRide(rideId, 'IN_PROGRESS');
+    await this.notifyRealtime(`ride:${rideId}`, 'IN_PROGRESS', { rideId, driverId });
+    await this.notifyRealtime(`driver:${driverId}`, 'IN_PROGRESS', { rideId, driverId });
   }
 
   async completeTrip(rideId: string, driverId: string): Promise<void> {
-    if (this.options.coreApiUrl) {
-      await fetch(`${this.options.coreApiUrl}/rides/${rideId}/transition`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ to: 'COMPLETED', driverId, actor: 'DRIVER' }),
-      });
-    }
+    await this.assertDriverAssigned(rideId, driverId);
+    await this.driveRide(rideId, 'COMPLETED');
 
-    // Release driver claim
-    await this.options.claimService.forceRelease(driverId);
-    this.activeRides.delete(rideId);
+    // Release driver claim (trip claim is owned by the ride id)
+    await this.options.claimService.releaseClaim(driverId, rideId);
+    this.dropRide(rideId);
 
     await this.notifyRealtime(`ride:${rideId}`, 'COMPLETED', { rideId, driverId });
     await this.notifyRealtime(`driver:${driverId}`, 'COMPLETED', { rideId, driverId });
@@ -585,19 +800,19 @@ export class DispatchEngine {
         });
         await this.options.redisPubSub.publish(`pubsub:room:${room}`, payload);
       } catch {
-        // ignore
+        // realtime fan-out is best effort
       }
     }
 
     if (this.options.gatewayBroadcastUrl) {
       try {
-        await fetch(`${this.options.gatewayBroadcastUrl}/events/broadcast`, {
+        await internalFetch(`${this.options.gatewayBroadcastUrl}/events/broadcast`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ room, type, data }),
         });
       } catch {
-        // ignore
+        // realtime fan-out is best effort
       }
     }
   }

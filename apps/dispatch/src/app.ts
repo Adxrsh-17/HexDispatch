@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { buildServer, AppError } from '@hexdispatch/shared';
+import { buildServer, AppError, registerInternalAuth } from '@hexdispatch/shared';
 import type { OfferManager } from './services/offer-manager';
 import type { DispatchEngine } from './services/dispatch-engine';
 import { rideRequestedEvent } from '@hexdispatch/contracts';
@@ -32,11 +32,17 @@ export async function buildDispatchApp(options: DispatchAppOptions): Promise<Fas
     logLevel,
   });
 
+  // Only the gateway and internal services may call dispatch (x-user-* is trusted because of it).
+  registerInternalAuth(app);
+
   // GET /offers/:id
   app.get('/offers/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     const offer = await offerManager.getOfferById(id);
-    if (!offer) {
+    const userId = request.headers['x-user-id'] as string | undefined;
+    const role = request.headers['x-user-role'] as string | undefined;
+    // An end user may read only their own offers; internal callers (no user header) read any.
+    if (!offer || (userId && role !== 'ADMIN' && offer.driverId !== userId)) {
       throw AppError.notFound(`Offer ${id} not found`);
     }
     return reply.send(offer);
@@ -95,7 +101,7 @@ export async function buildDispatchApp(options: DispatchAppOptions): Promise<Fas
     }
 
     await dispatchEngine.startTrip(id, driverId);
-    return reply.send({ status: 'ok', rideId: id, state: 'IN_TRIP' });
+    return reply.send({ status: 'ok', rideId: id, state: 'IN_PROGRESS' });
   });
 
   // POST /rides/:id/complete

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { withInternalAuth } from '@hexdispatch/shared';
 import { createTestDb } from './test-db';
 import { buildCoreApiApp } from '../src/app';
 import { users, rides, idempotencyKeys } from '../src/db/schema';
@@ -28,7 +29,7 @@ describe('Idempotency & Ride Creation (AC1)', () => {
       .returning();
     riderId = user!.id;
 
-    app = await buildCoreApiApp({ db, logLevel: 'silent' });
+    app = withInternalAuth(await buildCoreApiApp({ db, logLevel: 'silent' }));
     await app.ready();
   });
 
@@ -115,6 +116,7 @@ describe('Idempotency & Ride Creation (AC1)', () => {
       headers: {
         'idempotency-key': idempotencyKey,
         'x-user-id': riderId,
+        'x-user-role': 'RIDER',
       },
       payload: initialPayload,
     });
@@ -133,6 +135,7 @@ describe('Idempotency & Ride Creation (AC1)', () => {
       headers: {
         'idempotency-key': idempotencyKey,
         'x-user-id': riderId,
+        'x-user-role': 'RIDER',
       },
       payload: modifiedPayload,
     });

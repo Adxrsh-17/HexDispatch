@@ -43,6 +43,7 @@ const offerManager = new OfferManager({
   gatewayBroadcastUrl: process.env.GATEWAY_URL ?? 'http://localhost:3000',
   redisPubSub: redis,
   defaultOfferTimeoutSec: Number(process.env.OFFER_TIMEOUT_SEC ?? 15),
+  onRideGone: (rideId) => dispatchEngine?.dropRide(rideId),
   onReofferNeeded: async (rideId, excludedDriverId) => {
     if (dispatchEngine) {
       await dispatchEngine.handleReofferNeeded(rideId, excludedDriverId);
@@ -63,6 +64,8 @@ dispatchEngine = new DispatchEngine({
   maxOfferAttempts: Number(process.env.MAX_OFFER_ATTEMPTS ?? 3),
   batchWindowMs: Number(process.env.BATCH_WINDOW_MS ?? 2000),
   batchLagFallbackMs: Number(process.env.BATCH_LAG_FALLBACK_MS ?? 5000),
+  matchingTimeoutMs: Number(process.env.MATCHING_TIMEOUT_SEC ?? 60) * 1000,
+  batchSolveBudgetMs: Number(process.env.BATCH_SOLVE_BUDGET_MS ?? 1500),
   h3MatcherOwnerRes: Number(process.env.H3_MATCHER_OWNER_RES ?? 6),
   producer,
 });
@@ -75,6 +78,14 @@ try {
   );
 } catch (err) {
   console.warn('Failed to recover pending offers at startup:', err);
+}
+
+// Recover rides that core-api still has in REQUESTED/MATCHING (restart or crash while pending)
+try {
+  const pending = await dispatchEngine.recoverPendingRides();
+  console.log(`Dispatch startup recovery: ${pending.recovered} pending rides re-queued`);
+} catch (err) {
+  console.warn('Failed to recover pending rides at startup:', err);
 }
 
 // Kafka Consumer for ride.requested (Task 1)

@@ -4,7 +4,7 @@ import { latLngToCell, gridDisk } from 'h3-js';
 import type Redis from 'ioredis';
 import { Counter, Gauge, type Registry } from 'prom-client';
 import { TOPICS, type SurgeUpdatedEvent } from '@hexdispatch/contracts';
-import { AppError } from '@hexdispatch/shared';
+import { AppError, internalFetch } from '@hexdispatch/shared';
 import { quotes, surgeHistory, surgeOverrides, type Quote } from '../db/schema';
 import { calculateFare, type FareBreakdown } from '../fare';
 import { computeSurgeStep, type SurgeConfig, type SurgeExplainOutput } from '../surge-engine';
@@ -195,7 +195,7 @@ export class PricingService {
     // If locationUrl is available, query drivers nearby or in cell
     if (this.options.locationUrl) {
       try {
-        const res = await fetch(`${this.options.locationUrl}/drivers/cell/${cell}/count`);
+        const res = await internalFetch(`${this.options.locationUrl}/drivers/cell/${cell}/count`);
         if (res.ok) {
           const data = (await res.json()) as { count: number };
           return data.count;

@@ -3,7 +3,7 @@ import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { eq, desc, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { buildServer } from '@hexdispatch/shared';
+import { buildServer, registerInternalAuth } from '@hexdispatch/shared';
 import { ledgerEntries, payouts, type Payout } from './db/schema';
 import { DoubleEntryLedger } from './ledger/double-entry';
 import { MockPspClient } from './psp/mock-psp';
@@ -25,6 +25,9 @@ export async function buildPaymentApp(options: BuildPaymentAppOptions): Promise<
     service: 'payment',
     logLevel: options.logLevel ?? 'info',
   });
+
+  // Internal-only service: callers must present the internal token (see shared/internal-auth).
+  registerInternalAuth(app);
 
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);

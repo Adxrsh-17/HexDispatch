@@ -79,8 +79,10 @@ export class DriverClaimService {
   }
 
   /**
-   * Atomically acquire a claim on a driver.
-   * Returns true if claim succeeded, false if driver is already claimed.
+   * Atomically acquire a claim on a driver (single Lua script, so check-and-set cannot interleave).
+   * Returns true if claim succeeded, false if the driver is already claimed.
+   * Redis errors propagate: there is deliberately no non-atomic fallback, because a "best effort"
+   * GET-then-SET is exactly the double-assignment race this class exists to prevent.
    */
   async acquireClaim(
     driverId: string,
@@ -88,23 +90,15 @@ export class DriverClaimService {
     ttlSeconds: number = 20,
     claimType: 'OFFER' | 'TRIP' = 'OFFER',
   ): Promise<boolean> {
-    try {
-      const result = await this.redis.eval(
-        LUA_ACQUIRE_CLAIM,
-        1,
-        this.key(driverId),
-        ownerToken,
-        ttlSeconds,
-        claimType,
-      );
-      return result === 1;
-    } catch {
-      // In-memory fallback if eval is unavailable
-      const current = await this.redis.get(this.key(driverId));
-      if (current) return false;
-      await this.redis.set(this.key(driverId), `${ownerToken}:${claimType}`, 'EX', ttlSeconds);
-      return true;
-    }
+    const result = await this.redis.eval(
+      LUA_ACQUIRE_CLAIM,
+      1,
+      this.key(driverId),
+      ownerToken,
+      ttlSeconds,
+      claimType,
+    );
+    return result === 1;
   }
 
   /**
@@ -112,22 +106,13 @@ export class DriverClaimService {
    * Returns true if released or was not set, false if owned by another token.
    */
   async releaseClaim(driverId: string, ownerToken: string): Promise<boolean> {
-    try {
-      const result = await this.redis.eval(LUA_RELEASE_CLAIM, 1, this.key(driverId), ownerToken);
-      return result === 1;
-    } catch {
-      const current = await this.redis.get(this.key(driverId));
-      if (!current) return true;
-      if (current.startsWith(`${ownerToken}:`)) {
-        await this.redis.del(this.key(driverId));
-        return true;
-      }
-      return false;
-    }
+    const result = await this.redis.eval(LUA_RELEASE_CLAIM, 1, this.key(driverId), ownerToken);
+    return result === 1;
   }
 
   /**
-   * Upgrades an offer claim to an active trip claim (longer TTL)
+   * Upgrades an offer claim to an active trip claim (longer TTL). Returns false if the claim is
+   * now held by someone else, or has expired and been re-taken.
    */
   async upgradeClaim(
     driverId: string,
@@ -135,24 +120,15 @@ export class DriverClaimService {
     newOwner: string,
     ttlSeconds: number = 7200, // 2 hours for a trip
   ): Promise<boolean> {
-    try {
-      const result = await this.redis.eval(
-        LUA_UPGRADE_CLAIM,
-        1,
-        this.key(driverId),
-        expectedOwner,
-        newOwner,
-        ttlSeconds,
-      );
-      return result === 1;
-    } catch {
-      const current = await this.redis.get(this.key(driverId));
-      if (!current || current.startsWith(`${expectedOwner}:`)) {
-        await this.redis.set(this.key(driverId), `${newOwner}:TRIP`, 'EX', ttlSeconds);
-        return true;
-      }
-      return false;
-    }
+    const result = await this.redis.eval(
+      LUA_UPGRADE_CLAIM,
+      1,
+      this.key(driverId),
+      expectedOwner,
+      newOwner,
+      ttlSeconds,
+    );
+    return result === 1;
   }
 
   async getClaim(driverId: string): Promise<string | null> {

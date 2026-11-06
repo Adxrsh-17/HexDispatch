@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { eq } from 'drizzle-orm';
+import { and, eq, gt } from 'drizzle-orm';
 import type Redis from 'ioredis';
 import {
   TOPICS,
@@ -8,9 +8,12 @@ import {
   type OfferExpiredEvent,
   type RideMatchedEvent,
 } from '@hexdispatch/contracts';
-import { AppError } from '@hexdispatch/shared';
+import { AppError, createLogger, internalFetch } from '@hexdispatch/shared';
 import { offers, matchDecisions, type Offer } from '../db/schema';
 import type { DriverClaimService } from './driver-claim';
+import { RideStateError, requestTransition } from './core-client';
+
+const logger = createLogger({ service: 'offer-manager' });
 
 export interface CreateOfferParams {
   rideId: string;
@@ -37,8 +40,16 @@ export interface OfferManagerOptions {
   redisPubSub?: Redis;
   defaultOfferTimeoutSec?: number;
   onReofferNeeded?: (rideId: string, excludedDriverId: string) => Promise<void>;
+  /** core-api says the ride can no longer be dispatched (cancelled, terminal). Stop working on it. */
+  onRideGone?: (rideId: string) => void;
 }
 
+/**
+ * Offer lifecycle. Accept, decline and expire all move an offer out of PENDING with the same
+ * conditional `UPDATE ... WHERE status = 'PENDING'`, so exactly one of them wins and the losers
+ * perform no side effects (no double match, no re-offer after an accept).
+ * core-api owns trip state; every step that changes it checks the result.
+ */
 export class OfferManager {
   private activeTimers = new Map<string, NodeJS.Timeout>();
   private defaultTimeoutSec: number;
@@ -93,7 +104,27 @@ export class OfferManager {
       })
       .returning();
 
-    // 3. Set Redis offer key
+    // 3. Tell core-api (source of truth): MATCHING -> OFFERED. If it refuses, undo everything.
+    if (this.options.coreApiUrl) {
+      try {
+        await requestTransition(this.options.coreApiUrl, params.rideId, {
+          to: 'OFFERED',
+          actor: 'SYSTEM',
+        });
+      } catch (err) {
+        await this.options.db
+          .update(offers)
+          .set({ status: 'FAILED', updatedAt: new Date() })
+          .where(and(eq(offers.id, offerId), eq(offers.status, 'PENDING')));
+        await this.options.claimService.releaseClaim(params.driverId, offerId);
+        if (err instanceof RideStateError) {
+          this.options.onRideGone?.(params.rideId);
+        }
+        throw err;
+      }
+    }
+
+    // 4. Set Redis offer key
     await this.options.redis.set(
       this.offerKey(params.rideId, params.driverId),
       offerId,
@@ -101,10 +132,10 @@ export class OfferManager {
       Math.max(50, Math.round(timeoutSec * 1000)),
     );
 
-    // 4. Arm timeout timer
+    // 5. Arm timeout timer
     this.armTimeoutTimer(offerId, timeoutSec * 1000);
 
-    // 5. Publish offer.sent to Kafka
+    // 6. Publish offer.sent to Kafka (informational; a broker outage must not break dispatch)
     const offerSentEvent: OfferSentEvent = {
       eventId: randomUUID(),
       type: TOPICS.OFFER_SENT,
@@ -121,12 +152,9 @@ export class OfferManager {
         pickupEtaSec: Math.round(params.pickupEtaSec),
       },
     };
+    await this.publishSafely(TOPICS.OFFER_SENT, params.rideId, offerSentEvent);
 
-    if (this.options.producer) {
-      await this.options.producer.publish(TOPICS.OFFER_SENT, params.rideId, offerSentEvent);
-    }
-
-    // 6. Broadcast over WebSocket to driver room
+    // 7. Broadcast over WebSocket to driver room
     await this.notifyRealtime(`driver:${params.driverId}`, 'OFFER_SENT', offerSentEvent.payload);
 
     return inserted;
@@ -142,39 +170,62 @@ export class OfferManager {
       throw AppError.forbidden('Driver is not authorized to accept this offer');
     }
 
-    if (offer.status !== 'PENDING') {
-      throw AppError.conflict(`Offer cannot be accepted in status ${offer.status}`);
-    }
+    // 1. Win the offer atomically (only one of accept/decline/expire can).
+    const now = new Date();
+    const [accepted] = await this.options.db
+      .update(offers)
+      .set({ status: 'ACCEPTED', updatedAt: now })
+      .where(and(eq(offers.id, offerId), eq(offers.status, 'PENDING'), gt(offers.expiresAt, now)))
+      .returning();
 
-    if (new Date() >= new Date(offer.expiresAt)) {
-      await this.expireOffer(offerId);
-      throw AppError.conflict('Offer has expired');
+    if (!accepted) {
+      const current = await this.getOfferById(offerId);
+      if (current?.status === 'PENDING') {
+        await this.expireOffer(offerId); // past its deadline but the timer has not fired yet
+        throw AppError.conflict('Offer has expired');
+      }
+      throw AppError.conflict(`Offer cannot be accepted in status ${current?.status ?? 'unknown'}`);
     }
 
     this.clearTimeoutTimer(offerId);
 
-    // 1. Upgrade driver claim to TRIP
-    await this.options.claimService.upgradeClaim(
+    // 2. Upgrade driver claim to TRIP. If the claim is gone the driver may be double-booked.
+    const upgraded = await this.options.claimService.upgradeClaim(
       driverId,
       offerId,
       offer.rideId,
       7200, // 2-hour trip claim
     );
+    if (!upgraded) {
+      await this.failAcceptedOffer(offer, { releaseClaim: false, reoffer: true });
+      throw AppError.conflict('Driver claim was lost; offer cancelled');
+    }
 
-    // 2. Mark offer ACCEPTED
-    const now = new Date();
-    const [updated] = await this.options.db
-      .update(offers)
-      .set({ status: 'ACCEPTED', updatedAt: now })
-      .where(eq(offers.id, offerId))
-      .returning();
+    // 3. core-api must accept OFFERED -> ASSIGNED, otherwise nothing below is true.
+    if (this.options.coreApiUrl) {
+      try {
+        await requestTransition(this.options.coreApiUrl, offer.rideId, {
+          to: 'ASSIGNED',
+          actor: 'DRIVER',
+          driverId: offer.driverId,
+        });
+      } catch (err) {
+        const gone = err instanceof RideStateError;
+        await this.failAcceptedOffer(offer, { releaseClaim: true, reoffer: !gone });
+        if (gone) {
+          this.options.onRideGone?.(offer.rideId);
+          throw AppError.conflict('Ride can no longer be assigned (cancelled or already handled)');
+        }
+        throw err;
+      }
+    }
 
-    // 3. Clean up Redis offer key
+    // 4. Clean up Redis offer key
     await this.options.redis.del(this.offerKey(offer.rideId, offer.driverId));
 
-    // 4. Record in match_decisions
-    const decisionPolicy = updated.policy ?? 'greedy';
-    const decisionBatchId = updated.batchId ?? null;
+    // 5. Record in match_decisions
+    const decisionPolicy = accepted.policy ?? 'greedy';
+    const decisionBatchId = accepted.batchId ?? null;
     await this.options.db.insert(matchDecisions).values({
       id: randomUUID(),
       rideId: offer.rideId,
@@ -184,23 +235,6 @@ export class OfferManager {
       batchId: decisionBatchId,
       createdAt: now,
     });
-
-    // 5. Transition ride in core-api to ASSIGNED
-    if (this.options.coreApiUrl) {
-      try {
-        await fetch(`${this.options.coreApiUrl}/rides/${offer.rideId}/transition`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            to: 'ASSIGNED',
-            driverId: offer.driverId,
-            actor: 'DRIVER',
-          }),
-        });
-      } catch (err) {
-        console.error(`Failed to transition ride ${offer.rideId} to ASSIGNED:`, err);
-      }
-    }
 
     // 6. Publish ride.matched to Kafka
     const matchEvent: RideMatchedEvent = {
@@ -217,16 +251,13 @@ export class OfferManager {
         batchId: decisionBatchId,
       },
     };
-
-    if (this.options.producer) {
-      await this.options.producer.publish(TOPICS.RIDE_MATCHED, offer.rideId, matchEvent);
-    }
+    await this.publishSafely(TOPICS.RIDE_MATCHED, offer.rideId, matchEvent);
 
     // 7. Push to rider and driver over WebSocket
     await this.notifyRealtime(`ride:${offer.rideId}`, 'RIDE_MATCHED', matchEvent.payload);
     await this.notifyRealtime(`driver:${offer.driverId}`, 'RIDE_MATCHED', matchEvent.payload);
 
-    return updated;
+    return accepted;
   }
 
   async declineOffer(offerId: string, driverId: string, reason?: string): Promise<Offer> {
@@ -239,32 +270,16 @@ export class OfferManager {
       throw AppError.forbidden('Driver is not authorized to decline this offer');
     }
 
-    if (offer.status !== 'PENDING') {
-      return offer; // idempotent
+    const updated = await this.closePendingOffer(offerId, 'DECLINED');
+    if (!updated) {
+      return (await this.getOfferById(offerId)) ?? offer; // already decided: idempotent
     }
 
-    this.clearTimeoutTimer(offerId);
-
-    // 1. Release driver claim
-    await this.options.claimService.releaseClaim(driverId, offerId);
-
-    // 2. Mark offer DECLINED
-    const now = new Date();
-    const [updated] = await this.options.db
-      .update(offers)
-      .set({ status: 'DECLINED', updatedAt: now })
-      .where(eq(offers.id, offerId))
-      .returning();
-
-    // 3. Clean up Redis offer key
-    await this.options.redis.del(this.offerKey(offer.rideId, offer.driverId));
-
-    // 4. Publish offer.declined to Kafka
     const declinedEvent: OfferDeclinedEvent = {
       eventId: randomUUID(),
       type: TOPICS.OFFER_DECLINED,
       version: 1,
-      occurredAt: now.toISOString(),
+      occurredAt: new Date().toISOString(),
       correlationId: offerId,
       payload: {
         offerId,
@@ -273,53 +288,32 @@ export class OfferManager {
         reason,
       },
     };
-
-    if (this.options.producer) {
-      await this.options.producer.publish(TOPICS.OFFER_DECLINED, offer.rideId, declinedEvent);
-    }
-
-    // 5. Notify WebSocket
+    await this.publishSafely(TOPICS.OFFER_DECLINED, offer.rideId, declinedEvent);
     await this.notifyRealtime(`driver:${driverId}`, 'OFFER_DECLINED', {
       offerId,
       rideId: offer.rideId,
     });
 
-    // 6. Trigger re-offer for this ride
-    if (this.options.onReofferNeeded) {
-      await this.options.onReofferNeeded(offer.rideId, driverId);
-    }
-
+    await this.releaseRideAndReoffer(offer.rideId, driverId);
     return updated;
   }
 
   async expireOffer(offerId: string): Promise<Offer | null> {
     const offer = await this.getOfferById(offerId);
-    if (!offer || offer.status !== 'PENDING') {
-      return offer;
+    if (!offer) {
+      return null;
     }
 
-    this.clearTimeoutTimer(offerId);
+    const updated = await this.closePendingOffer(offerId, 'EXPIRED');
+    if (!updated) {
+      return offer; // accepted, declined or expired already: nothing to do, no side effects
+    }
 
-    // 1. Release driver claim
-    await this.options.claimService.releaseClaim(offer.driverId, offerId);
-
-    // 2. Mark offer EXPIRED
-    const now = new Date();
-    const [updated] = await this.options.db
-      .update(offers)
-      .set({ status: 'EXPIRED', updatedAt: now })
-      .where(eq(offers.id, offerId))
-      .returning();
-
-    // 3. Clean up Redis offer key
-    await this.options.redis.del(this.offerKey(offer.rideId, offer.driverId));
-
-    // 4. Publish offer.expired to Kafka
     const expiredEvent: OfferExpiredEvent = {
       eventId: randomUUID(),
       type: TOPICS.OFFER_EXPIRED,
       version: 1,
-      occurredAt: now.toISOString(),
+      occurredAt: new Date().toISOString(),
       correlationId: offerId,
       payload: {
         offerId,
@@ -327,27 +321,90 @@ export class OfferManager {
         driverId: offer.driverId,
       },
     };
-
-    if (this.options.producer) {
-      await this.options.producer.publish(TOPICS.OFFER_EXPIRED, offer.rideId, expiredEvent);
-    }
-
-    // 5. Notify WebSocket
+    await this.publishSafely(TOPICS.OFFER_EXPIRED, offer.rideId, expiredEvent);
     await this.notifyRealtime(`driver:${offer.driverId}`, 'OFFER_EXPIRED', {
       offerId,
       rideId: offer.rideId,
     });
 
-    // 6. Trigger re-offer
-    if (this.options.onReofferNeeded) {
-      await this.options.onReofferNeeded(offer.rideId, offer.driverId);
-    }
-
+    await this.releaseRideAndReoffer(offer.rideId, offer.driverId);
     return updated;
   }
 
   /**
-   * Task 8 Recovery: Re-arm pending offers on dispatch service restart.
+   * Move a PENDING offer to a terminal status. Returns the updated row only for the single caller
+   * that won; everyone else gets null and must do nothing.
+   */
+  private async closePendingOffer(
+    offerId: string,
+    status: 'DECLINED' | 'EXPIRED',
+  ): Promise<Offer | null> {
+    const [updated] = await this.options.db
+      .update(offers)
+      .set({ status, updatedAt: new Date() })
+      .where(and(eq(offers.id, offerId), eq(offers.status, 'PENDING')))
+      .returning();
+    if (!updated) return null;
+
+    this.clearTimeoutTimer(offerId);
+    await this.options.claimService.releaseClaim(updated.driverId, offerId);
+    await this.options.redis.del(this.offerKey(updated.rideId, updated.driverId));
+    return updated;
+  }
+
+  /** An accepted offer could not be completed. Undo it and (optionally) hand the ride back. */
+  private async failAcceptedOffer(
+    offer: Offer,
+    opts: { releaseClaim: boolean; reoffer: boolean },
+  ): Promise<void> {
+    await this.options.db
+      .update(offers)
+      .set({ status: 'FAILED', updatedAt: new Date() })
+      .where(and(eq(offers.id, offer.id), eq(offers.status, 'ACCEPTED')));
+    if (opts.releaseClaim) {
+      // After upgradeClaim the claim owner is the ride id.
+      await this.options.claimService.releaseClaim(offer.driverId, offer.rideId);
+    }
+    await this.options.redis.del(this.offerKey(offer.rideId, offer.driverId));
+    if (opts.reoffer) {
+      await this.releaseRideAndReoffer(offer.rideId, offer.driverId);
+    }
+  }
+
+  /** OFFERED -> MATCHING in core-api, then let dispatch pick the next driver. */
+  private async releaseRideAndReoffer(rideId: string, excludedDriverId: string): Promise<void> {
+    if (this.options.coreApiUrl) {
+      try {
+        await requestTransition(this.options.coreApiUrl, rideId, {
+          to: 'MATCHING',
+          actor: 'SYSTEM',
+        });
+      } catch (err) {
+        if (err instanceof RideStateError) {
+          // Rider cancelled (or the ride is otherwise terminal): stop dispatching it.
+          this.options.onRideGone?.(rideId);
+          return;
+        }
+        logger.error({ err, rideId }, 'could not return ride to MATCHING; not re-offering');
+        return;
+      }
+    }
+    if (this.options.onReofferNeeded) {
+      await this.options.onReofferNeeded(rideId, excludedDriverId);
+    }
+  }
+
+  private async publishSafely(topic: string, key: string, event: unknown): Promise<void> {
+    if (!this.options.producer) return;
+    try {
+      await this.options.producer.publish(topic, key, event);
+    } catch (err) {
+      logger.error({ err, topic, key }, 'kafka publish failed (informational event dropped)');
+    }
+  }
+
+  /**
+   * Recovery: re-arm pending offers on dispatch service restart.
    */
   async recoverPendingOffers(): Promise<{ recoveredCount: number; expiredCount: number }> {
     const pendingList = await this.options.db
@@ -377,7 +434,9 @@ export class OfferManager {
     this.clearTimeoutTimer(offerId);
     const timer = setTimeout(
       () => {
-        void this.expireOffer(offerId);
+        this.expireOffer(offerId).catch((err: unknown) => {
+          logger.error({ err, offerId }, 'offer expiry failed');
+        });
       },
       Math.max(10, delayMs),
     );
@@ -405,20 +464,20 @@ export class OfferManager {
         });
         await this.options.redisPubSub.publish(`pubsub:room:${room}`, payload);
       } catch {
-        // ignore
+        // realtime fan-out is best effort
       }
     }
 
     // 2. Through Gateway HTTP broadcast endpoint if specified
     if (this.options.gatewayBroadcastUrl) {
       try {
-        await fetch(`${this.options.gatewayBroadcastUrl}/events/broadcast`, {
+        await internalFetch(`${this.options.gatewayBroadcastUrl}/events/broadcast`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ room, type, data }),
         });
       } catch {
-        // ignore
+        // realtime fan-out is best effort
       }
     }
   }

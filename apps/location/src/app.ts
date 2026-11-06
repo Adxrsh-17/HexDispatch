@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import { z } from 'zod';
-import { buildServer, AppError } from '@hexdispatch/shared';
+import { buildServer, AppError, registerInternalAuth } from '@hexdispatch/shared';
 import type { DriverIndex } from './driver-index';
 import type { NearbySearch } from './nearby';
 import type { LocationBatchPublisher } from './batch-publisher';
@@ -33,6 +33,9 @@ export async function buildLocationApp(options: LocationAppOptions): Promise<Fas
     service: 'location',
     logLevel,
   });
+
+  // Internal-only service: callers must present the internal token (see shared/internal-auth).
+  registerInternalAuth(app);
 
   await app.register(fastifyWebsocket);
 

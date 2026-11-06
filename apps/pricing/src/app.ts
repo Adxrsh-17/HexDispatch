@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { buildServer, AppError } from '@hexdispatch/shared';
+import { buildServer, AppError, registerInternalAuth } from '@hexdispatch/shared';
 import type { PricingService } from './services/pricing-service';
 
 export interface PricingAppOptions {
@@ -35,6 +35,9 @@ export async function buildPricingApp(options: PricingAppOptions): Promise<Fasti
     service: 'pricing',
     logLevel,
   });
+
+  // Internal-only service: callers must present the internal token (see shared/internal-auth).
+  registerInternalAuth(app);
 
   // POST /quotes: Request fare quote with current surge
   app.post('/quotes', async (request, reply) => {
