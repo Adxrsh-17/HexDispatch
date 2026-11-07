@@ -18,6 +18,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "sim": "pnpm --filter @hexdispatch/simulator start",
+    "eval": "tsx tools/simulator/scripts/evaluate.ts",
     "chaos": "tsx tools/chaos/runner.ts",
     "bench:load": "tsx tools/load-tests/run-all-load-tests.ts",
     "demo": "tsx tools/scripts/demo.ts"

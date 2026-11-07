@@ -5,7 +5,6 @@ import {
   type MatchContext,
   GreedyPolicy,
   DEFAULT_MATCHING_CONFIG,
-  haversineMeters,
   type LatLng,
 } from '@hexdispatch/matching';
 import { computeSurgeStep } from '@hexdispatch/pricing/surge-engine';
@@ -15,9 +14,9 @@ import { DiscreteEngine } from './engine/discrete-engine';
 import {
   type SimEvent,
   type RideRequestedPayload,
+  type RiderAbandonPayload,
   type MatchCyclePayload,
   type SurgeCyclePayload,
-  type RetryMatchPayload,
   type OfferEvaluatePayload,
   type OfferTimeoutPayload,
   type DriverArrivePickupPayload,
@@ -39,11 +38,13 @@ interface ActiveRide {
   requestedAtSec: number;
   matchedAtSec?: number;
   pickupEtaSec?: number;
+  pickupArrivedAtSec?: number;
   assignedDriverId?: string;
   attempts: number;
   excludedDrivers: Set<string>;
   activeOfferId?: string;
   surgeMultiplier?: number;
+  patienceExpired?: boolean;
 }
 
 export interface InjectedAnomaly {
@@ -63,6 +64,12 @@ export interface AnomalyReport {
   injected: InjectedAnomaly[];
 }
 
+export interface DriverRideInterval {
+  rideId: string;
+  startSec: number;
+  endSec?: number;
+}
+
 export interface SimulationResult {
   scenario: ScenarioConfig;
   policy: MatchingPolicy;
@@ -71,6 +78,7 @@ export interface SimulationResult {
   drivers: readonly SimDriver[];
   collector: MetricsCollector;
   anomalies?: AnomalyReport;
+  noDriverOverlap: boolean;
 }
 
 export class CitySimulator {
@@ -85,6 +93,7 @@ export class CitySimulator {
 
   private offerTimeoutSec: number;
   private maxOfferAttempts: number;
+  readonly patienceSec: number;
   private nextOfferId = 0;
   private nextRideId = 0;
   readonly isBatched: boolean;
@@ -101,6 +110,7 @@ export class CitySimulator {
     string,
     { smoothedDemand: number; smoothedSupply: number; multiplier: number }
   >();
+  private driverAssignments = new Map<string, DriverRideInterval[]>();
 
   constructor(
     readonly scenario: ScenarioConfig,
@@ -109,16 +119,28 @@ export class CitySimulator {
     batchWindowSec = 2,
     surgeEnabled?: boolean,
     injectAnomalies = false,
+    patienceSec?: number,
   ) {
     this.rng = new RngManager(seed);
     this.city = new CityModel(scenario.city);
     this.demand = new DemandModel(scenario.demand);
     this.policy = policy ?? new GreedyPolicy();
     this.isBatched = this.policy.name === 'batched';
-    this.batchWindowSec = batchWindowSec;
+
+    // Window loop is shared across both policies
+    this.batchWindowSec =
+      batchWindowSec > 0
+        ? batchWindowSec
+        : scenario.matching?.batchWindowSec && scenario.matching.batchWindowSec > 0
+          ? scenario.matching.batchWindowSec
+          : 2;
+
     this.isSurgeEnabled = surgeEnabled ?? scenario.surge?.enabled ?? false;
     this.surgeIntervalSec = scenario.surge?.updateIntervalSec ?? 30;
     this.injectAnomalies = injectAnomalies;
+    this.patienceSec = patienceSec ?? scenario.matching?.patienceSec ?? 120;
+    this.offerTimeoutSec = scenario.matching?.offerTimeoutSec ?? 15;
+    this.maxOfferAttempts = scenario.matching?.maxOfferAttempts ?? 3;
 
     if (this.injectAnomalies) {
       this.trustEngine = new TrustEngine({
@@ -130,9 +152,6 @@ export class CitySimulator {
       });
     }
 
-    this.offerTimeoutSec = scenario.matching?.offerTimeoutSec ?? 15;
-    this.maxOfferAttempts = scenario.matching?.maxOfferAttempts ?? 3;
-
     this.setupEventHandlers();
   }
 
@@ -142,50 +161,47 @@ export class CitySimulator {
       this.handleRideRequested(event);
     });
 
-    // 2. MATCH_CYCLE (for batched matching)
+    // 2. RIDER_ABANDON (patience timeout)
+    this.engine.on<RiderAbandonPayload>('RIDER_ABANDON', (event) => {
+      this.handleRiderAbandon(event);
+    });
+
+    // 3. MATCH_CYCLE (periodic window loop for both greedy & batched)
     this.engine.on<MatchCyclePayload>('MATCH_CYCLE', (event) => {
       this.handleMatchCycle(event);
     });
 
-    // 3. SURGE_CYCLE (for dynamic pricing and surge)
+    // 4. SURGE_CYCLE
     this.engine.on<SurgeCyclePayload>('SURGE_CYCLE', (event) => {
       this.handleSurgeCycle(event);
     });
 
-    // 4. RETRY_MATCH
-    this.engine.on<RetryMatchPayload>('RETRY_MATCH', (event) => {
-      const ride = this.activeRides.get(event.payload.rideId);
-      if (ride && !ride.activeOfferId && !ride.assignedDriverId) {
-        this.dispatchRide(ride, event.time);
-      }
-    });
-
-    // 3. OFFER_EVALUATE
+    // 5. OFFER_EVALUATE
     this.engine.on<OfferEvaluatePayload>('OFFER_EVALUATE', (event) => {
       this.handleOfferEvaluate(event);
     });
 
-    // 4. OFFER_TIMEOUT
+    // 6. OFFER_TIMEOUT
     this.engine.on<OfferTimeoutPayload>('OFFER_TIMEOUT', (event) => {
       this.handleOfferTimeout(event);
     });
 
-    // 5. DRIVER_ARRIVE_PICKUP
+    // 7. DRIVER_ARRIVE_PICKUP
     this.engine.on<DriverArrivePickupPayload>('DRIVER_ARRIVE_PICKUP', (event) => {
       this.handleDriverArrivePickup(event);
     });
 
-    // 6. TRIP_START
+    // 8. TRIP_START
     this.engine.on<TripStartPayload>('TRIP_START', (event) => {
       this.handleTripStart(event);
     });
 
-    // 7. TRIP_COMPLETE
+    // 9. TRIP_COMPLETE
     this.engine.on<TripCompletePayload>('TRIP_COMPLETE', (event) => {
       this.handleTripComplete(event);
     });
 
-    // 8. DRIVER_ROAM
+    // 10. DRIVER_ROAM
     this.engine.on<DriverRoamPayload>('DRIVER_ROAM', (event) => {
       this.handleDriverRoam(event);
     });
@@ -207,11 +223,48 @@ export class CitySimulator {
 
       driver.transitionStatus('IDLE', 0);
       this.drivers.set(driverId, driver);
+      this.driverAssignments.set(driverId, []);
 
       // Schedule initial roaming check
       const roamDelay = this.rng.driver.nextFloat(30, 90);
       this.engine.schedule<DriverRoamPayload>('DRIVER_ROAM', roamDelay, { driverId });
     }
+  }
+
+  private recordDriverAssignmentStart(driverId: string, rideId: string, startSec: number): void {
+    const list = this.driverAssignments.get(driverId);
+    if (list) {
+      list.push({ rideId, startSec });
+    }
+  }
+
+  private recordDriverAssignmentEnd(driverId: string, rideId: string, endSec: number): void {
+    const list = this.driverAssignments.get(driverId);
+    if (list) {
+      const interval = list.find((it) => it.rideId === rideId && it.endSec === undefined);
+      if (interval) {
+        interval.endSec = endSec;
+      }
+    }
+  }
+
+  verifyNoDriverOverlap(): boolean {
+    for (const intervals of this.driverAssignments.values()) {
+      const sorted = [...intervals].sort((a, b) => a.startSec - b.startSec);
+      for (let i = 1; i < sorted.length; i++) {
+        const prev = sorted[i - 1]!;
+        const curr = sorted[i]!;
+        const prevEnd = prev.endSec ?? this.scenario.durationSec;
+        if (curr.startSec < prevEnd) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  getDriverAssignments(): ReadonlyMap<string, DriverRideInterval[]> {
+    return this.driverAssignments;
   }
 
   private scheduleNextRide(currentTimeSec: number): void {
@@ -279,10 +332,10 @@ export class CitySimulator {
       const elasticity = this.scenario.surge?.priceElasticity ?? 1.2;
       const pAbandon = 1 - Math.exp(-elasticity * (surgeMultiplier - 1.0));
       if (this.rng.demand.nextFloat(0, 1) < pAbandon) {
-        this.collector.recordUnmatchedRide({
+        this.collector.recordAbandoned({
           rideId,
           requestedAtSec: event.time,
-          attempts: 0,
+          endedAtSec: event.time,
           reason: 'PRICE_SURGE_ABANDONED',
         });
         this.scheduleNextRide(event.time);
@@ -301,13 +354,30 @@ export class CitySimulator {
     };
     this.activeRides.set(rideId, ride);
 
+    // Schedule patience timeout
+    this.engine.schedule<RiderAbandonPayload>('RIDER_ABANDON', this.patienceSec, { rideId });
+
     // Schedule subsequent demand arrival
     this.scheduleNextRide(event.time);
+  }
 
-    // In greedy mode: match immediately on arrival
-    // In batched mode: periodic MATCH_CYCLE will process pending batch
-    if (!this.isBatched) {
-      this.dispatchRide(ride, event.time);
+  private handleRiderAbandon(event: SimEvent<RiderAbandonPayload>): void {
+    const ride = this.activeRides.get(event.payload.rideId);
+    if (!ride) return;
+
+    if (!ride.activeOfferId && !ride.assignedDriverId) {
+      // Unmatched rider gave up waiting
+      this.collector.recordAbandoned({
+        rideId: ride.id,
+        requestedAtSec: ride.requestedAtSec,
+        endedAtSec: event.time,
+        reason: 'PATIENCE_EXPIRED',
+      });
+      this.activeRides.delete(ride.id);
+    } else if (ride.activeOfferId) {
+      // Driver is currently considering the offer; mark patience expired
+      // If driver accepts -> completed! If driver declines/times out -> immediately abandons
+      ride.patienceExpired = true;
     }
   }
 
@@ -380,16 +450,25 @@ export class CitySimulator {
   private handleMatchCycle(event: SimEvent<MatchCyclePayload>): void {
     const currentTimeSec = event.time;
 
-    // 1. Gather all pending rides
+    // 1. Gather all pending rides and prune expired / max-attempt rides
     const pendingRides: ActiveRide[] = [];
     for (const ride of this.activeRides.values()) {
       if (!ride.activeOfferId && !ride.assignedDriverId) {
         if (ride.attempts >= this.maxOfferAttempts) {
-          this.collector.recordUnmatchedRide({
+          this.collector.recordNoDriver({
             rideId: ride.id,
             requestedAtSec: ride.requestedAtSec,
+            endedAtSec: currentTimeSec,
             attempts: ride.attempts,
-            reason: 'MAX_ATTEMPTS_EXCEEDED',
+            reason: 'NO_DRIVER_FOUND',
+          });
+          this.activeRides.delete(ride.id);
+        } else if (currentTimeSec - ride.requestedAtSec >= this.patienceSec) {
+          this.collector.recordAbandoned({
+            rideId: ride.id,
+            requestedAtSec: ride.requestedAtSec,
+            endedAtSec: currentTimeSec,
+            reason: 'PATIENCE_EXPIRED',
           });
           this.activeRides.delete(ride.id);
         } else {
@@ -399,15 +478,16 @@ export class CitySimulator {
     }
 
     if (pendingRides.length > 0) {
-      // 2. Gather all IDLE drivers
+      // 2. Gather IDLE drivers
       const candidates: DriverCandidate[] = [];
       for (const d of this.drivers.values()) {
-        if (d.status !== 'IDLE') continue;
-        candidates.push({
-          id: d.id,
-          location: d.location,
-          idleSinceMs: d.idleSinceSec * 1000,
-        });
+        if (d.status === 'IDLE') {
+          candidates.push({
+            id: d.id,
+            location: d.location,
+            idleSinceMs: d.idleSinceSec * 1000,
+          });
+        }
       }
 
       if (candidates.length > 0) {
@@ -447,95 +527,6 @@ export class CitySimulator {
     }
   }
 
-  private dispatchRide(ride: ActiveRide, currentTimeSec: number): boolean {
-    if (ride.attempts >= this.maxOfferAttempts) {
-      this.collector.recordUnmatchedRide({
-        rideId: ride.id,
-        requestedAtSec: ride.requestedAtSec,
-        attempts: ride.attempts,
-        reason: 'MAX_ATTEMPTS_EXCEEDED',
-      });
-      this.activeRides.delete(ride.id);
-      return false;
-    }
-
-    // 1. Gather available IDLE drivers within max pickup distance
-    const candidates: DriverCandidate[] = [];
-    const maxDistanceMeters = DEFAULT_MATCHING_CONFIG.maxPickupEtaSec * this.city.baseSpeedMps;
-
-    for (const d of this.drivers.values()) {
-      if (d.status !== 'IDLE') continue;
-      if (ride.excludedDrivers.has(d.id)) continue;
-
-      const dist = haversineMeters(d.location, ride.pickup);
-      if (dist <= maxDistanceMeters) {
-        candidates.push({
-          id: d.id,
-          location: d.location,
-          idleSinceMs: d.idleSinceSec * 1000,
-        });
-      }
-    }
-
-    if (candidates.length === 0) {
-      ride.attempts += 1;
-      if (ride.attempts >= this.maxOfferAttempts) {
-        this.collector.recordUnmatchedRide({
-          rideId: ride.id,
-          requestedAtSec: ride.requestedAtSec,
-          attempts: ride.attempts,
-          reason: 'NO_DRIVER_FOUND',
-        });
-        this.activeRides.delete(ride.id);
-        return false;
-      }
-
-      // Retry matching in 5 seconds
-      this.engine.schedule<RetryMatchPayload>('RETRY_MATCH', 5, { rideId: ride.id });
-      return false;
-    }
-
-    // 2. Call MatchingPolicy (from packages/matching)
-    const request: RideRequest = {
-      id: ride.id,
-      pickup: ride.pickup,
-      requestedAtMs: ride.requestedAtSec * 1000,
-      excludedDriverIds: Array.from(ride.excludedDrivers),
-    };
-
-    const ctx: MatchContext = {
-      nowMs: currentTimeSec * 1000,
-      config: {
-        speedMps: this.city.baseSpeedMps * this.city.speedMultiplier,
-        maxPickupEtaSec: DEFAULT_MATCHING_CONFIG.maxPickupEtaSec,
-      },
-    };
-
-    const result = this.policy.match([request], candidates, ctx);
-    if (result.assignments.length === 0) {
-      ride.attempts += 1;
-      if (ride.attempts >= this.maxOfferAttempts) {
-        this.collector.recordUnmatchedRide({
-          rideId: ride.id,
-          requestedAtSec: ride.requestedAtSec,
-          attempts: ride.attempts,
-          reason: 'NO_DRIVER_FOUND',
-        });
-        this.activeRides.delete(ride.id);
-        return false;
-      }
-
-      this.engine.schedule<RetryMatchPayload>('RETRY_MATCH', 5, { rideId: ride.id });
-      return false;
-    }
-
-    // 3. Make offer to best assignment
-    const assignment = result.assignments[0]!;
-    const driver = this.drivers.get(assignment.driverId)!;
-    this.sendOffer(ride, driver, assignment.pickupEtaSec, currentTimeSec);
-    return true;
-  }
-
   private sendOffer(
     ride: ActiveRide,
     driver: SimDriver,
@@ -559,20 +550,52 @@ export class CitySimulator {
     const decision = driver.evaluateOffer(pickupEtaSec, this.offerTimeoutSec, this.rng.acceptance);
 
     if (decision.isTimeout) {
-      // Schedule timeout event
       this.engine.schedule<OfferTimeoutPayload>('OFFER_TIMEOUT', this.offerTimeoutSec, {
         offerId,
         rideId: ride.id,
         driverId: driver.id,
       });
     } else {
-      // Schedule evaluate event with decision delay
       this.engine.schedule<OfferEvaluatePayload>('OFFER_EVALUATE', decision.responseDelaySec, {
         offerId,
         rideId: ride.id,
         driverId: driver.id,
         accepted: decision.accept,
       });
+    }
+  }
+
+  private handleOfferEnd(offerId: string, rideId: string, driverId: string, timeSec: number): void {
+    const ride = this.activeRides.get(rideId);
+    const driver = this.drivers.get(driverId);
+
+    if (!ride || !driver || ride.activeOfferId !== offerId) return;
+
+    driver.transitionStatus('IDLE', timeSec);
+    driver.currentOfferId = undefined;
+    driver.currentRideId = undefined;
+
+    ride.excludedDrivers.add(driverId);
+    ride.activeOfferId = undefined;
+    ride.assignedDriverId = undefined;
+
+    if (ride.attempts >= this.maxOfferAttempts) {
+      this.collector.recordNoDriver({
+        rideId: ride.id,
+        requestedAtSec: ride.requestedAtSec,
+        endedAtSec: timeSec,
+        attempts: ride.attempts,
+        reason: 'NO_DRIVER_FOUND',
+      });
+      this.activeRides.delete(ride.id);
+    } else if (ride.patienceExpired || timeSec - ride.requestedAtSec >= this.patienceSec) {
+      this.collector.recordAbandoned({
+        rideId: ride.id,
+        requestedAtSec: ride.requestedAtSec,
+        endedAtSec: timeSec,
+        reason: 'PATIENCE_EXPIRED',
+      });
+      this.activeRides.delete(ride.id);
     }
   }
 
@@ -584,9 +607,11 @@ export class CitySimulator {
     if (!ride || !driver || ride.activeOfferId !== offerId) return;
 
     if (accepted) {
-      // Driver ACCEPTED offer
       driver.acceptedOffers += 1;
       driver.transitionStatus('DISPATCHED', event.time);
+      ride.assignedDriverId = driver.id;
+      ride.activeOfferId = undefined;
+      this.recordDriverAssignmentStart(driver.id, ride.id, event.time);
 
       const pickupTravelTimeSec = this.city.getTravelTimeSec(driver.location, ride.pickup);
       this.engine.schedule<DriverArrivePickupPayload>('DRIVER_ARRIVE_PICKUP', pickupTravelTimeSec, {
@@ -594,45 +619,18 @@ export class CitySimulator {
         driverId,
       });
     } else {
-      // Driver DECLINED offer
       driver.declinedOffers += 1;
-      driver.transitionStatus('IDLE', event.time);
-      driver.currentOfferId = undefined;
-      driver.currentRideId = undefined;
-
-      ride.excludedDrivers.add(driverId);
-      ride.activeOfferId = undefined;
-      ride.assignedDriverId = undefined;
-
-      // In greedy mode: immediate re-offer
-      // In batched mode: picked up by next MATCH_CYCLE
-      if (!this.isBatched) {
-        this.dispatchRide(ride, event.time);
-      }
+      this.handleOfferEnd(offerId, rideId, driverId, event.time);
     }
   }
 
   private handleOfferTimeout(event: SimEvent<OfferTimeoutPayload>): void {
     const { offerId, rideId, driverId } = event.payload;
-    const ride = this.activeRides.get(rideId);
     const driver = this.drivers.get(driverId);
-
-    if (!ride || !driver || ride.activeOfferId !== offerId) return;
-
-    driver.timedOutOffers += 1;
-    driver.transitionStatus('IDLE', event.time);
-    driver.currentOfferId = undefined;
-    driver.currentRideId = undefined;
-
-    ride.excludedDrivers.add(driverId);
-    ride.activeOfferId = undefined;
-    ride.assignedDriverId = undefined;
-
-    // In greedy mode: immediate re-offer
-    // In batched mode: picked up by next MATCH_CYCLE
-    if (!this.isBatched) {
-      this.dispatchRide(ride, event.time);
+    if (driver) {
+      driver.timedOutOffers += 1;
     }
+    this.handleOfferEnd(offerId, rideId, driverId, event.time);
   }
 
   private handleDriverArrivePickup(event: SimEvent<DriverArrivePickupPayload>): void {
@@ -641,6 +639,7 @@ export class CitySimulator {
     const driver = this.drivers.get(driverId);
     if (!ride || !driver) return;
 
+    ride.pickupArrivedAtSec = event.time;
     driver.location = { ...ride.pickup };
     // Boarding delay: 15 seconds
     this.engine.schedule<TripStartPayload>('TRIP_START', 15, { rideId, driverId });
@@ -711,13 +710,15 @@ export class CitySimulator {
       surgeMultiplier,
     );
 
+    this.recordDriverAssignmentEnd(driver.id, ride.id, event.time);
+
     this.collector.recordCompletedRide({
       rideId: ride.id,
       driverId: driver.id,
       requestedAtSec: ride.requestedAtSec,
       matchedAtSec: ride.matchedAtSec ?? event.time,
       pickupEtaSec: ride.pickupEtaSec ?? 0,
-      pickupArrivedAtSec: event.time,
+      pickupArrivedAtSec: ride.pickupArrivedAtSec ?? event.time,
       completedAtSec: event.time,
       tripDurationSec: event.time - (ride.matchedAtSec ?? event.time),
       fareCents,
@@ -726,19 +727,6 @@ export class CitySimulator {
     });
 
     this.activeRides.delete(rideId);
-
-    // If there are waiting unmatched rides, check if any can match this newly idle driver
-    for (const waitingRide of this.activeRides.values()) {
-      if (!waitingRide.activeOfferId && !waitingRide.assignedDriverId) {
-        if (!waitingRide.excludedDrivers.has(driver.id)) {
-          const dist = haversineMeters(driver.location, waitingRide.pickup);
-          if (dist <= DEFAULT_MATCHING_CONFIG.maxPickupEtaSec * this.city.baseSpeedMps) {
-            this.dispatchRide(waitingRide, event.time);
-            break;
-          }
-        }
-      }
-    }
 
     // Schedule next roaming check
     const roamDelay = this.rng.driver.nextFloat(30, 90);
@@ -822,12 +810,10 @@ export class CitySimulator {
     // Schedule first passenger ride
     this.scheduleNextRide(0);
 
-    // If batched policy, start periodic match cycles
-    if (this.isBatched && this.batchWindowSec > 0) {
-      this.engine.scheduleAt<MatchCyclePayload>('MATCH_CYCLE', this.batchWindowSec, {
-        windowSec: this.batchWindowSec,
-      });
-    }
+    // Periodic match cycles for ALL policies
+    this.engine.scheduleAt<MatchCyclePayload>('MATCH_CYCLE', this.batchWindowSec, {
+      windowSec: this.batchWindowSec,
+    });
 
     // If surge is enabled, start periodic surge cycles
     if (this.isSurgeEnabled && this.surgeIntervalSec > 0) {
@@ -838,6 +824,25 @@ export class CitySimulator {
 
     // Run discrete event loop
     this.engine.runUntil(this.scenario.durationSec);
+
+    // Record still waiting at end of simulation
+    for (const ride of this.activeRides.values()) {
+      this.collector.recordStillWaiting({
+        rideId: ride.id,
+        requestedAtSec: ride.requestedAtSec,
+        endedAtSec: this.scenario.durationSec,
+        assignedDriverId: ride.assignedDriverId,
+      });
+    }
+
+    // Close open driver intervals at durationSec
+    for (const intervals of this.driverAssignments.values()) {
+      for (const interval of intervals) {
+        if (interval.endSec === undefined) {
+          interval.endSec = this.scenario.durationSec;
+        }
+      }
+    }
 
     const driversList = Array.from(this.drivers.values());
     const metrics = this.collector.calculate(driversList, this.scenario.durationSec);
@@ -878,6 +883,8 @@ export class CitySimulator {
       };
     }
 
+    const noDriverOverlap = this.verifyNoDriverOverlap();
+
     return {
       scenario: this.scenario,
       policy: this.policy,
@@ -886,6 +893,7 @@ export class CitySimulator {
       drivers: driversList,
       collector: this.collector,
       anomalies: anomalyReport,
+      noDriverOverlap,
     };
   }
 }

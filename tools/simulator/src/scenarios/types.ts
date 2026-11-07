@@ -13,6 +13,7 @@ export interface MatchingSettings {
   batchWindowSec?: number;
   maxOfferAttempts?: number;
   offerTimeoutSec?: number;
+  patienceSec?: number;
 }
 
 export interface SurgeSimulatorConfig {

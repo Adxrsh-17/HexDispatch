@@ -5,6 +5,7 @@ export type EventType =
   | 'DRIVER_ONLINE'
   | 'DRIVER_OFFLINE'
   | 'RIDE_REQUESTED'
+  | 'RIDER_ABANDON'
   | 'MATCH_CYCLE'
   | 'SURGE_CYCLE'
   | 'RETRY_MATCH'
@@ -36,6 +37,10 @@ export interface RideRequestedPayload {
   rideId: string;
   pickup: LatLng;
   dropoff: LatLng;
+}
+
+export interface RiderAbandonPayload {
+  rideId: string;
 }
 
 export interface MatchCyclePayload {

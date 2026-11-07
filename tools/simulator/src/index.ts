@@ -29,6 +29,7 @@ interface ParsedArgs {
   seed: number;
   duration?: number;
   window: number;
+  patience?: number;
   surge?: boolean;
   anomalies?: boolean;
   outDir: string;
@@ -42,6 +43,7 @@ function parseCliArgs(argv: string[]): ParsedArgs {
   let seed = 42;
   let duration: number | undefined;
   let window = 2;
+  let patience: number | undefined;
   let surge: boolean | undefined;
   let anomalies: boolean | undefined;
   let outDir = path.resolve(__dirname, '../../../docs/benchmarks');
@@ -59,6 +61,8 @@ function parseCliArgs(argv: string[]): ParsedArgs {
       duration = Number.parseInt(args[++i]!, 10);
     } else if (arg === '--window' && args[i + 1]) {
       window = Number.parseFloat(args[++i]!);
+    } else if (arg === '--patience' && args[i + 1]) {
+      patience = Number.parseFloat(args[++i]!);
     } else if (arg === '--surge') {
       surge = true;
     } else if (arg === '--no-surge') {
@@ -72,7 +76,18 @@ function parseCliArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  return { scenario, policy, seed, duration, window, surge, anomalies, outDir, writeFiles };
+  return {
+    scenario,
+    policy,
+    seed,
+    duration,
+    window,
+    patience,
+    surge,
+    anomalies,
+    outDir,
+    writeFiles,
+  };
 }
 
 function loadScenario(name: string): ScenarioConfig {
@@ -126,6 +141,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     parsed.window,
     parsed.surge,
     parsed.anomalies,
+    parsed.patience,
   );
   const startMs = Date.now();
   const result = sim.run();
@@ -136,30 +152,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   console.log('\n--- Simulation Summary ---');
   console.log(`Requests:          ${metrics.totalRequests}`);
   console.log(
-    `Completed:         ${metrics.completedRides} (${(metrics.matchRate * 100).toFixed(1)}%)`,
+    `Completed:         ${metrics.completedRides} (${(metrics.completionRate * 100).toFixed(1)}%)`,
   );
-  console.log(
-    `Unmatched:         ${metrics.unmatchedRides} (${(metrics.noDriverRate * 100).toFixed(1)}%)`,
-  );
-  if (metrics.surgeAbandonedRides !== undefined && metrics.surgeAbandonedRides > 0) {
-    console.log(
-      `Surge Abandoned:   ${metrics.surgeAbandonedRides} (${((metrics.surgeAbandonedRides / metrics.totalRequests) * 100).toFixed(1)}%)`,
-    );
-  }
-  console.log(
-    `Pickup ETA Avg:    ${Math.round(metrics.pickupEtaAvgSec)}s (~${(metrics.pickupEtaAvgSec / 60).toFixed(1)} min)`,
-  );
-  console.log(
-    `Pickup ETA p95:    ${Math.round(metrics.pickupEtaP95Sec)}s (~${(metrics.pickupEtaP95Sec / 60).toFixed(1)} min)`,
-  );
-  console.log(`Pickup ETA Median: ${Math.round(metrics.pickupEtaMedianSec)}s`);
+  console.log(`Abandoned:         ${metrics.abandonedRides}`);
+  console.log(`No-Driver:         ${metrics.noDriverRides}`);
+  console.log(`Still Waiting:     ${metrics.stillWaitingAtEnd}`);
+  console.log(`Share <= 5min:     ${(metrics.sharePickedUpWithin5Min * 100).toFixed(1)}%`);
+  console.log(`Mean Pickup Wait:  ${metrics.meanPickupWaitSec}s`);
+  console.log(`p95 Pickup Wait:   ${metrics.p95PickupWaitSec}s`);
   console.log(`Driver Util:       ${(metrics.driverUtilisation * 100).toFixed(1)}%`);
   console.log(`Avg Idle Time:     ${Math.round(metrics.idleTimeAvgSec)}s`);
   console.log(`Rides/Driver-Hr:   ${metrics.ridesPerDriverHour}`);
   console.log(`Total Revenue:     $${(metrics.totalFareRevenueCents / 100).toFixed(2)}`);
   console.log(`Avg Driver Earn:   $${(metrics.avgDriverEarningsCents / 100).toFixed(2)}`);
-  console.log(`Earnings Gini:     ${metrics.giniCoefficient}`);
+  console.log(`Earnings Gini:     ${metrics.earningsSpread}`);
   console.log(`p90/p10 Spread:    ${metrics.p90p10EarningsRatio}x`);
+  console.log(`No Driver Overlap: ${result.noDriverOverlap}`);
   console.log(`Execution Time:    ${elapsedMs}ms`);
 
   if (result.anomalies) {

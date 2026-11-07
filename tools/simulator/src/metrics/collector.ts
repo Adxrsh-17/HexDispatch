@@ -15,23 +15,63 @@ export interface CompletedRideRecord {
   dropoff: LatLng;
 }
 
+export interface AbandonedRideRecord {
+  rideId: string;
+  requestedAtSec: number;
+  endedAtSec: number;
+  reason: 'PRICE_SURGE_ABANDONED' | 'PATIENCE_EXPIRED';
+}
+
+export interface NoDriverRideRecord {
+  rideId: string;
+  requestedAtSec: number;
+  endedAtSec: number;
+  attempts: number;
+  reason: 'NO_DRIVER_FOUND' | 'MAX_ATTEMPTS_EXCEEDED';
+}
+
+export interface StillWaitingRideRecord {
+  rideId: string;
+  requestedAtSec: number;
+  endedAtSec: number;
+  assignedDriverId?: string;
+}
+
 export interface UnmatchedRideRecord {
   rideId: string;
   requestedAtSec: number;
   attempts: number;
-  reason: 'NO_DRIVER_FOUND' | 'MAX_ATTEMPTS_EXCEEDED' | 'TIMEOUT' | 'PRICE_SURGE_ABANDONED';
+  reason:
+    | 'NO_DRIVER_FOUND'
+    | 'MAX_ATTEMPTS_EXCEEDED'
+    | 'TIMEOUT'
+    | 'PRICE_SURGE_ABANDONED'
+    | 'PATIENCE_EXPIRED';
 }
 
 export interface SimMetrics {
   totalRequests: number;
-  matchedRides: number;
   completedRides: number;
+  abandonedRides: number;
+  noDriverRides: number;
+  stillWaitingAtEnd: number;
+
+  completionRate: number; // completedRides / totalRequests
+  sharePickedUpWithin5Min: number; // share of ALL requests picked up within 300s
+  meanPickupWaitSec: number; // computed over ALL requests with unserved censored
+  p95PickupWaitSec: number; // 95th percentile over ALL requests with unserved censored
+
+  driverUtilisation: number;
+  ridesPerDriverHour: number;
+  earningsSpread: number; // Gini coefficient of driver earnings
+
+  // Legacy & supplementary fields
+  matchedRides: number;
   unmatchedRides: number;
   surgeAbandonedRides: number;
   cancelledRides: number;
-
-  matchRate: number; // completedRides / totalRequests
-  noDriverRate: number; // unmatchedRides / totalRequests
+  matchRate: number;
+  noDriverRate: number;
   cancellationRate: number;
 
   pickupEtaAvgSec: number;
@@ -39,10 +79,7 @@ export interface SimMetrics {
   pickupEtaMedianSec: number;
 
   totalDriverShiftHours: number;
-  driverUtilisation: number;
   idleTimeAvgSec: number;
-  ridesPerDriverHour: number;
-
   totalFareRevenueCents: number;
   avgDriverEarningsCents: number;
   giniCoefficient: number;
@@ -51,7 +88,9 @@ export interface SimMetrics {
 
 export class MetricsCollector {
   private completedRides: CompletedRideRecord[] = [];
-  private unmatchedRides: UnmatchedRideRecord[] = [];
+  private abandonedRides: AbandonedRideRecord[] = [];
+  private noDriverRides: NoDriverRideRecord[] = [];
+  private stillWaitingRides: StillWaitingRideRecord[] = [];
   private cancelledCount = 0;
   private totalRequestsCount = 0;
 
@@ -67,30 +106,111 @@ export class MetricsCollector {
     this.completedRides.push(record);
   }
 
-  recordUnmatchedRide(record: UnmatchedRideRecord): void {
-    this.unmatchedRides.push(record);
+  recordAbandoned(record: AbandonedRideRecord): void {
+    this.abandonedRides.push(record);
+  }
+
+  recordNoDriver(record: NoDriverRideRecord): void {
+    this.noDriverRides.push(record);
+  }
+
+  recordStillWaiting(record: StillWaitingRideRecord): void {
+    this.stillWaitingRides.push(record);
+  }
+
+  /** Backwards compatibility helper */
+  recordUnmatchedRide(record: {
+    rideId: string;
+    requestedAtSec: number;
+    attempts: number;
+    reason: string;
+    endedAtSec?: number;
+  }): void {
+    const endedAtSec = record.endedAtSec ?? record.requestedAtSec;
+    if (
+      record.reason === 'PRICE_SURGE_ABANDONED' ||
+      record.reason === 'PATIENCE_EXPIRED' ||
+      record.reason === 'TIMEOUT'
+    ) {
+      this.abandonedRides.push({
+        rideId: record.rideId,
+        requestedAtSec: record.requestedAtSec,
+        endedAtSec,
+        reason:
+          record.reason === 'PRICE_SURGE_ABANDONED' ? 'PRICE_SURGE_ABANDONED' : 'PATIENCE_EXPIRED',
+      });
+    } else {
+      this.noDriverRides.push({
+        rideId: record.rideId,
+        requestedAtSec: record.requestedAtSec,
+        endedAtSec,
+        attempts: record.attempts,
+        reason: 'NO_DRIVER_FOUND',
+      });
+    }
   }
 
   calculate(drivers: readonly SimDriver[], durationSec: number): SimMetrics {
     const totalRequests = this.totalRequestsCount;
     const completedCount = this.completedRides.length;
-    const unmatchedCount = this.unmatchedRides.length;
-    const surgeAbandonedRides = this.unmatchedRides.filter(
+    const abandonedCount = this.abandonedRides.length;
+    const noDriverCount = this.noDriverRides.length;
+    const stillWaitingCount = this.stillWaitingRides.length;
+    const unmatchedCount = abandonedCount + noDriverCount + stillWaitingCount;
+
+    const surgeAbandonedRides = this.abandonedRides.filter(
       (r) => r.reason === 'PRICE_SURGE_ABANDONED',
     ).length;
 
-    const matchRate = totalRequests > 0 ? completedCount / totalRequests : 0;
-    const noDriverRate = totalRequests > 0 ? unmatchedCount / totalRequests : 0;
+    const completionRate = totalRequests > 0 ? completedCount / totalRequests : 0;
+    const matchRate = completionRate;
+    const noDriverRate = totalRequests > 0 ? (noDriverCount + abandonedCount) / totalRequests : 0;
     const cancellationRate = totalRequests > 0 ? this.cancelledCount / totalRequests : 0;
 
-    // Pickup ETAs
+    // Share picked up within 5 minutes (300 s) over ALL requests
+    let pickedUpWithin5MinCount = 0;
+    for (const r of this.completedRides) {
+      const waitSec = r.pickupArrivedAtSec - r.requestedAtSec;
+      if (waitSec <= 300) {
+        pickedUpWithin5MinCount += 1;
+      }
+    }
+    const sharePickedUpWithin5Min = totalRequests > 0 ? pickedUpWithin5MinCount / totalRequests : 0;
+
+    // Pickup wait for ALL requests (with unserved censored at abandonment or end time)
+    const allWaitTimesSec: number[] = [];
+    for (const r of this.completedRides) {
+      allWaitTimesSec.push(Math.max(0, r.pickupArrivedAtSec - r.requestedAtSec));
+    }
+    for (const r of this.abandonedRides) {
+      allWaitTimesSec.push(Math.max(0, r.endedAtSec - r.requestedAtSec));
+    }
+    for (const r of this.noDriverRides) {
+      allWaitTimesSec.push(Math.max(0, r.endedAtSec - r.requestedAtSec));
+    }
+    for (const r of this.stillWaitingRides) {
+      allWaitTimesSec.push(Math.max(0, r.endedAtSec - r.requestedAtSec));
+    }
+
+    allWaitTimesSec.sort((a, b) => a - b);
+    const meanPickupWaitSec =
+      allWaitTimesSec.length > 0
+        ? allWaitTimesSec.reduce((sum, v) => sum + v, 0) / allWaitTimesSec.length
+        : 0;
+
+    const p95Idx =
+      allWaitTimesSec.length > 0
+        ? Math.min(allWaitTimesSec.length - 1, Math.floor(allWaitTimesSec.length * 0.95))
+        : 0;
+    const p95PickupWaitSec = allWaitTimesSec.length > 0 ? allWaitTimesSec[p95Idx]! : 0;
+
+    // Pickup ETAs over completed rides (legacy reporting)
     const etas = this.completedRides.map((r) => r.pickupEtaSec).sort((a, b) => a - b);
     const pickupEtaAvgSec = etas.length > 0 ? etas.reduce((sum, v) => sum + v, 0) / etas.length : 0;
-
-    const p95Index = Math.min(etas.length - 1, Math.floor(etas.length * 0.95));
-    const pickupEtaP95Sec = etas.length > 0 ? etas[p95Index]! : 0;
-
-    const medianIndex = Math.floor(etas.length * 0.5);
+    const completedP95Idx =
+      etas.length > 0 ? Math.min(etas.length - 1, Math.floor(etas.length * 0.95)) : 0;
+    const pickupEtaP95Sec = etas.length > 0 ? etas[completedP95Idx]! : 0;
+    const medianIndex = etas.length > 0 ? Math.floor(etas.length * 0.5) : 0;
     const pickupEtaMedianSec = etas.length > 0 ? etas[medianIndex]! : 0;
 
     // Driver stats
@@ -101,7 +221,6 @@ export class MetricsCollector {
     const earningsList: number[] = [];
 
     for (const d of drivers) {
-      // Finalize any ongoing state slice up to durationSec
       d.transitionStatus(d.status, durationSec);
 
       const shiftDurationSec = Math.max(1, d.shiftEndSec - d.shiftStartSec);
@@ -125,21 +244,34 @@ export class MetricsCollector {
 
     return {
       totalRequests,
-      matchedRides: completedCount,
       completedRides: completedCount,
+      abandonedRides: abandonedCount,
+      noDriverRides: noDriverCount,
+      stillWaitingAtEnd: stillWaitingCount,
+
+      completionRate: Number(completionRate.toFixed(4)),
+      sharePickedUpWithin5Min: Number(sharePickedUpWithin5Min.toFixed(4)),
+      meanPickupWaitSec: Number(meanPickupWaitSec.toFixed(2)),
+      p95PickupWaitSec: Number(p95PickupWaitSec.toFixed(2)),
+
+      driverUtilisation: Number(driverUtilisation.toFixed(4)),
+      ridesPerDriverHour: Number(ridesPerDriverHour.toFixed(2)),
+      earningsSpread: Number(giniCoefficient.toFixed(4)),
+
+      matchedRides: completedCount,
       unmatchedRides: unmatchedCount,
       surgeAbandonedRides,
       cancelledRides: this.cancelledCount,
       matchRate: Number(matchRate.toFixed(4)),
       noDriverRate: Number(noDriverRate.toFixed(4)),
       cancellationRate: Number(cancellationRate.toFixed(4)),
+
       pickupEtaAvgSec: Number(pickupEtaAvgSec.toFixed(2)),
       pickupEtaP95Sec: Number(pickupEtaP95Sec.toFixed(2)),
       pickupEtaMedianSec: Number(pickupEtaMedianSec.toFixed(2)),
+
       totalDriverShiftHours: Number(totalDriverShiftHours.toFixed(2)),
-      driverUtilisation: Number(driverUtilisation.toFixed(4)),
       idleTimeAvgSec: Number(idleTimeAvgSec.toFixed(2)),
-      ridesPerDriverHour: Number(ridesPerDriverHour.toFixed(2)),
       totalFareRevenueCents: totalRevenueCents,
       avgDriverEarningsCents: Number(avgDriverEarningsCents.toFixed(2)),
       giniCoefficient: Number(giniCoefficient.toFixed(4)),
@@ -149,6 +281,18 @@ export class MetricsCollector {
 
   getCompletedRides(): readonly CompletedRideRecord[] {
     return this.completedRides;
+  }
+
+  getAbandonedRides(): readonly AbandonedRideRecord[] {
+    return this.abandonedRides;
+  }
+
+  getNoDriverRides(): readonly NoDriverRideRecord[] {
+    return this.noDriverRides;
+  }
+
+  getStillWaitingRides(): readonly StillWaitingRideRecord[] {
+    return this.stillWaitingRides;
   }
 }
 
